@@ -5,14 +5,22 @@
     - lr: 초반 warmup 후 milestone에서 x0.1
     - loss: RPN(obj+box) + RoI(cls+box) + mask, 전부 합산해 역전파
 
-사용 예 (COCO 포맷 커스텀 데이터, 폐 X-ray 등):
+사용 예 1) COCO (80 클래스 -> 배경 포함 81):
+
+    python tools/train.py \
+        --train-images data/coco/val2017 \
+        --train-ann    data/coco/annotations/instances_val2017.json \
+        --num-classes  81 \
+        --epochs 12 --batch-size 2 --lr 0.005 \
+        --pretrained            # COCO 백본/FPN/RPN 가중치로 초기화(권장)
+
+사용 예 2) 커스텀 데이터 (폐 X-ray 등, 전경 2 클래스 -> 배경 포함 3):
 
     python tools/train.py \
         --train-images data/lung/train \
         --train-ann    data/lung/annotations/train.json \
         --num-classes  3 \
-        --epochs 20 --batch-size 2 --lr 0.005 \
-        --pretrained            # COCO 백본/FPN/RPN 가중치로 초기화(권장)
+        --epochs 20 --batch-size 2 --lr 0.005 --pretrained
 
 `--num-classes`는 배경을 포함한 값이다 (전경 클래스 K개면 K+1).
 """
@@ -20,6 +28,7 @@
 import argparse
 import sys
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +39,35 @@ from torch.utils.data import DataLoader
 
 from maskrcnn import Config, MaskRCNN
 from maskrcnn.data import CocoInstanceDataset, collate_fn
+
+
+class SmoothedValue:
+    """최근 window개의 이동평균과 전체 평균을 함께 추적한다."""
+
+    def __init__(self, window: int = 50):
+        self.deque = deque(maxlen=window)
+        self.total = 0.0
+        self.count = 0
+
+    def update(self, value: float):
+        self.deque.append(value)
+        self.total += value
+        self.count += 1
+
+    @property
+    def avg(self) -> float:
+        return sum(self.deque) / max(len(self.deque), 1)
+
+    @property
+    def global_avg(self) -> float:
+        return self.total / max(self.count, 1)
+
+
+def format_time(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
 
 
 def parse_args():
@@ -140,11 +178,35 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- 설정 배너
+    print("=" * 66)
+    print("  Mask R-CNN 학습 설정")
+    print("-" * 66)
+    print(f"  device            : {device}")
+    print(f"  학습 이미지       : {len(dataset)} 장")
+    print(f"  클래스(배경 포함) : {args.num_classes}")
+    print(f"  epochs            : {args.epochs}")
+    print(f"  batch size        : {args.batch_size}")
+    print(f"  iters / epoch     : {iters_per_epoch}")
+    print(f"  총 iterations     : {total_iters}")
+    print(f"  base lr           : {cfg.learning_rate}")
+    print(f"  lr 감쇠 시점(iter): {milestones}  (x0.1)")
+    print(f"  warmup iters      : {cfg.warmup_iters}")
+    print(f"  입력 해상도       : min {args.min_size} / max {args.max_size}")
+    print(f"  pretrained init   : {args.pretrained}")
+    print(f"  grad clip         : {args.grad_clip}")
+    print(f"  체크포인트 경로   : {out_dir}")
+    print("=" * 66, flush=True)
+
     # ---- 학습 루프
+    iter_time = SmoothedValue(window=50)
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        meters = defaultdict(SmoothedValue)  # epoch별 손실 이동평균
         epoch_start = time.time()
+
         for i, (images, image_sizes, targets) in enumerate(loader):
+            step_start = time.time()
             images = images.to(device)
             targets = move_targets(targets, device)
 
@@ -160,12 +222,32 @@ def main():
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             optimizer.step()
 
-            if i % args.log_interval == 0:
-                parts = " ".join(f"{k}={v.item():.3f}" for k, v in losses.items())
-                lr_now = optimizer.param_groups[0]["lr"]
-                print(f"[epoch {epoch} it {i}/{iters_per_epoch}] "
-                      f"loss={loss.item():.3f} lr={lr_now:.5f} | {parts}")
+            # 손실/시간 집계
+            meters["loss"].update(loss.item())
+            for k, v in losses.items():
+                meters[k].update(v.item())
+            iter_time.update(time.time() - step_start)
             global_step += 1
+
+            if i % args.log_interval == 0 or i == iters_per_epoch - 1:
+                lr_now = optimizer.param_groups[0]["lr"]
+                eta = format_time(iter_time.avg * (total_iters - global_step))
+                mem = ""
+                if device.type == "cuda":
+                    mem = f" mem={torch.cuda.max_memory_allocated() / 1e9:.1f}G"
+                print(
+                    f"E{epoch}/{args.epochs} "
+                    f"[{i:>4}/{iters_per_epoch}] "
+                    f"step {global_step}/{total_iters}  "
+                    f"loss={meters['loss'].avg:.3f}  "
+                    f"cls={meters['loss_box_cls'].avg:.3f} "
+                    f"box={meters['loss_box_reg'].avg:.3f} "
+                    f"mask={meters['loss_mask'].avg:.3f} "
+                    f"rpn_obj={meters['rpn_objectness'].avg:.3f} "
+                    f"rpn_box={meters['rpn_box_reg'].avg:.3f}  "
+                    f"lr={lr_now:.5f}  {iter_time.avg:.2f}s/it  eta {eta}{mem}",
+                    flush=True,
+                )
 
         ckpt_path = out_dir / f"maskrcnn_epoch{epoch}.pth"
         torch.save({
@@ -176,8 +258,15 @@ def main():
             "num_classes": args.num_classes,
             "label_to_name": dataset.label_to_name,
         }, ckpt_path)
-        print(f"epoch {epoch} 완료 ({time.time() - epoch_start:.0f}s) "
-              f"-> {ckpt_path}")
+        epoch_time = time.time() - epoch_start
+        print("-" * 66)
+        print(
+            f"[epoch {epoch} 완료] "
+            f"avg_loss={meters['loss'].global_avg:.3f}  "
+            f"time={format_time(epoch_time)}  "
+            f"-> {ckpt_path}"
+        )
+        print("-" * 66, flush=True)
 
     print("학습 종료 [OK]")
 
