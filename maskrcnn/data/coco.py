@@ -46,6 +46,7 @@ class CocoInstanceDataset(Dataset):
                  min_size: int = MIN_SIZE, max_size: int = MAX_SIZE,
                  skip_empty: bool = True):
         self.img_dir = Path(img_dir)
+        self.ann_file = ann_file
         self.coco = _CocoIndex(ann_file)
         self.min_size = min_size
         self.max_size = max_size

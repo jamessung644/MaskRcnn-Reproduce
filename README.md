@@ -20,12 +20,15 @@ maskrcnn/
 │   ├── heads.py           # Box head (2×FC 1024), Mask head (4×conv → deconv → 28×28)
 │   ├── matcher.py         # IoU 매처 + 균형 샘플러 + smooth_L1 (학습 타깃)
 │   └── mask_rcnn.py       # 전체 조립 + 추론 후처리 + 학습(RoI 샘플링/손실)
+├── evaluate.py            # 체크포인트 로드 + 원본좌표 예측 + COCO mAP 평가
 ├── utils/
 │   ├── box_ops.py         # 박스 인코딩/디코딩, IoU, clip
 │   ├── tv_weights.py      # torchvision 사전학습 가중치 매핑 (전체/부분 로드)
 │   └── visualize.py       # 마스크 페이스트 + detection 시각화
 tools/
-└── train.py               # SGD 학습 루프 (warmup + step decay, 체크포인트)
+├── train.py               # SGD 학습 루프 (warmup + step decay, 체크포인트, 선택적 mAP)
+├── evaluate.py            # 체크포인트 -> COCO mAP (bbox/segm)
+└── infer.py               # 체크포인트 -> 추론 -> detection 시각화 저장
 tests/
 ├── smoke_test.py          # 추론 경로 shape 검증
 ├── train_smoke_test.py    # 학습 경로 검증 (합성 타깃)
@@ -77,6 +80,36 @@ python tools/train.py \
   클래스 의존 predictor는 무작위 초기화로 남긴다 → 파인튜닝에 적합.
 - polygon segmentation은 의존성 없이 동작. RLE 마스크는 `pycocotools` 필요.
 - 체크포인트는 `checkpoints/`에 epoch마다 저장(`--resume`으로 재개).
+- 출력: 설정 배너 + iteration별 항목 손실(이동평균)·lr·속도·ETA + epoch 요약.
+
+**epoch마다 검증 mAP를 함께 보려면** (`pycocotools` 필요):
+
+```bash
+python tools/train.py ... \
+    --eval-images data/coco/val2017 \
+    --eval-ann    data/coco/annotations/instances_val2017.json \
+    --eval-interval 1 --eval-max-images 500   # 빠른 확인용 500장만
+```
+
+### 평가 (COCO mAP)
+
+```bash
+python tools/evaluate.py \
+    --checkpoint  checkpoints/maskrcnn_epoch11.pth \
+    --val-images  data/coco/val2017 \
+    --val-ann     data/coco/annotations/instances_val2017.json
+# bbox / segm 각각 AP, AP50, AP75 출력 (pycocotools COCOeval)
+```
+
+### 추론 + 시각화
+
+```bash
+python tools/infer.py \
+    --checkpoint checkpoints/maskrcnn_epoch11.pth \
+    --images data/coco/val2017 \
+    --output outputs/ --max-images 20 --score-thresh 0.5
+# 박스+라벨+마스크 오버레이를 outputs/det_*.jpg 로 저장
+```
 
 ## 검증 결과
 

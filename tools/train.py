@@ -87,6 +87,13 @@ def parse_args():
                    help="COCO 사전학습 가중치로 클래스 독립 파라미터 초기화")
     p.add_argument("--output", default="checkpoints", help="체크포인트 저장 경로")
     p.add_argument("--resume", default=None, help="이어서 학습할 체크포인트")
+    # ---- 선택: epoch마다 val mAP 평가 (pycocotools 필요)
+    p.add_argument("--eval-images", default=None, help="검증 이미지 디렉토리")
+    p.add_argument("--eval-ann", default=None, help="검증 annotation JSON")
+    p.add_argument("--eval-interval", type=int, default=1,
+                   help="몇 epoch마다 평가할지 (기본 1)")
+    p.add_argument("--eval-max-images", type=int, default=None,
+                   help="평가에 쓸 이미지 수 제한 (빠른 확인용)")
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--device", default=None, help="cuda/mps/cpu (기본 자동)")
     p.add_argument("--min-size", type=int, default=800)
@@ -133,6 +140,15 @@ def main():
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, collate_fn=collate_fn, drop_last=True)
+
+    # ---- 선택: 검증셋 (epoch마다 mAP 평가)
+    eval_dataset = None
+    if args.eval_images and args.eval_ann:
+        eval_dataset = CocoInstanceDataset(
+            args.eval_images, args.eval_ann, contiguous_ids=True,
+            min_size=args.min_size, max_size=args.max_size, skip_empty=False)
+        print(f"검증 이미지 {len(eval_dataset)}장 "
+              f"(epoch {args.eval_interval}마다 mAP 평가)")
 
     # ---- 모델
     model = MaskRCNN(cfg)
@@ -267,6 +283,20 @@ def main():
             f"-> {ckpt_path}"
         )
         print("-" * 66, flush=True)
+
+        # ---- epoch마다 검증셋 mAP 평가 (선택)
+        if eval_dataset is not None and (epoch + 1) % args.eval_interval == 0:
+            from maskrcnn.evaluate import evaluate_coco
+            print(f"[epoch {epoch}] 검증셋 평가 중...", flush=True)
+            model.eval()
+            metrics = evaluate_coco(
+                model, eval_dataset, device,
+                max_images=args.eval_max_images,
+                min_size=args.min_size, max_size=args.max_size,
+                verbose=False)
+            summary = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+            print(f"[epoch {epoch} mAP] {summary}", flush=True)
+            model.train()
 
     print("학습 종료 [OK]")
 
