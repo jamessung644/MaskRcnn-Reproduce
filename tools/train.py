@@ -35,6 +35,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# CUDA 컨텍스트 생성(=torch import) 전에 설정해야 적용된다.
+# 배치마다 이미지 크기가 달라(가변 해상도) 캐싱 할당자가 조각나기 쉬운데,
+# expandable_segments를 켜면 그로 인한 가짜 OOM을 크게 줄여준다.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -116,6 +121,20 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true",
                    help="bfloat16 mixed precision (CUDA 전용)")
+    p.add_argument("--freeze-at", type=int, default=2,
+                   help="백본 고정 stage 수 (Detectron 기본값 2 = stem+layer1). "
+                        "0이면 전체 학습 — activation 메모리를 가장 많이 쓰지만 "
+                        "가장 유연하다. OOM이면 늘려본다 (최대 5).")
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="백본 layer1~4에 gradient checkpointing 적용. "
+                        "메모리를 크게 아끼는 대신 backward에서 재계산하느라 "
+                        "iter당 시간이 늘어난다(대략 +20~30%%).")
+    p.add_argument("--ddp-find-unused", action="store_true",
+                   help="DDP find_unused_parameters=True. 이 코드베이스는 "
+                        "skip_empty로 GT 없는 이미지를 거르고 proposal에 GT박스를 "
+                        "항상 섞어 넣기 때문에 mask branch가 매 스텝 활성화되어 "
+                        "보통 필요 없다 — 꺼두면 DDP가 버킷 뷰를 재사용해 메모리/속도 "
+                        "이득이 있다. 커스텀 데이터로 빈 이미지가 섞일 수 있으면 켠다.")
     return p.parse_args()
 
 
@@ -185,7 +204,8 @@ def main():
               f"(epoch {args.eval_interval}마다 mAP 평가)")
 
     # ---- 모델
-    model = MaskRCNN(cfg)
+    model = MaskRCNN(cfg, freeze_at=args.freeze_at,
+                     grad_checkpoint=args.grad_checkpoint)
     if args.pretrained:
         from maskrcnn.utils.tv_weights import load_torchvision_pretrained
         stats = load_torchvision_pretrained(model)
@@ -195,7 +215,8 @@ def main():
     model.to(device).train()
 
     if ddp_active:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank],
+                    find_unused_parameters=args.ddp_find_unused)
 
     # ---- optimizer / 스케줄
     params = [p for p in model.parameters() if p.requires_grad]
@@ -258,6 +279,9 @@ def main():
         print(f"  pretrained init   : {args.pretrained}")
         print(f"  amp (bf16)        : {use_amp}")
         print(f"  grad clip         : {args.grad_clip}")
+        print(f"  backbone freeze_at: {args.freeze_at}")
+        print(f"  grad checkpoint   : {args.grad_checkpoint}")
+        print(f"  ddp find_unused   : {args.ddp_find_unused}")
         print(f"  체크포인트 경로   : {out_dir}")
         print("=" * 66, flush=True)
 

@@ -18,6 +18,7 @@ from typing import Dict, List
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 class FrozenBatchNorm2d(nn.Module):
@@ -85,10 +86,26 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-    """C2~C5 멀티스케일 피처를 반환하는 ResNet 백본."""
+    """C2~C5 멀티스케일 피처를 반환하는 ResNet 백본.
 
-    def __init__(self, stage_blocks: List[int]):
+    freeze_at: Detectron 관례(FPN 논문/Mask R-CNN 구현체 기본값)대로 stem과
+        초반 stage는 학습하지 않는다. requires_grad=False로 두면 그 구간은
+        autograd가 activation을 저장할 필요가 없어져(모든 입력이 grad를
+        요구하지 않으므로) 메모리를 크게 아낀다 — 특히 layer1(C2)은 stride 4로
+        해상도가 가장 커서 activation 메모리 비중이 가장 크다.
+            0: 고정 없음, 1: stem만, 2: stem+layer1(기본, Detectron 기본값),
+            3: stem+layer1+layer2, 4: +layer3, 5: 전체 고정
+    grad_checkpoint: True면 layer1~layer4를 torch.utils.checkpoint로 감싸
+        forward activation을 저장하지 않고 backward 시 재계산한다(연산량↑,
+        메모리↓). 고정된(freeze) stage는 어차피 activation을 안 남기므로
+        checkpoint 대상에서 제외한다.
+    """
+
+    def __init__(self, stage_blocks: List[int], freeze_at: int = 2,
+                 grad_checkpoint: bool = False):
         super().__init__()
+        self.grad_checkpoint = grad_checkpoint
+
         # stem: conv1
         self.conv1 = nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False)
         self.bn1 = FrozenBatchNorm2d(64)
@@ -107,6 +124,19 @@ class ResNet(nn.Module):
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
 
+        self._freeze_stages(freeze_at)
+
+    def _freeze_stages(self, freeze_at: int):
+        stem = [self.conv1, self.bn1]
+        stages = [self.layer1, self.layer2, self.layer3, self.layer4]
+        modules_to_freeze = []
+        if freeze_at >= 1:
+            modules_to_freeze += stem
+        modules_to_freeze += stages[: max(freeze_at - 1, 0)]
+        for m in modules_to_freeze:
+            for p in m.parameters():
+                p.requires_grad = False
+
     @staticmethod
     def _make_stage(in_channels: int, bottleneck_channels: int,
                     num_blocks: int, stride: int) -> nn.Sequential:
@@ -118,18 +148,25 @@ class ResNet(nn.Module):
             )
         return nn.Sequential(*blocks)
 
+    def _run_stage(self, stage: nn.Sequential, x: Tensor) -> Tensor:
+        # 고정된 stage는 어차피 grad를 안 남기니 checkpoint가 무의미하다.
+        needs_grad = any(p.requires_grad for p in stage.parameters())
+        if self.grad_checkpoint and self.training and needs_grad:
+            return checkpoint(stage, x, use_reentrant=False)
+        return stage(x)
+
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        c2 = self.layer1(x)
-        c3 = self.layer2(c2)
-        c4 = self.layer3(c3)
-        c5 = self.layer4(c4)
+        c2 = self._run_stage(self.layer1, x)
+        c3 = self._run_stage(self.layer2, c2)
+        c4 = self._run_stage(self.layer3, c3)
+        c5 = self._run_stage(self.layer4, c4)
         return {"c2": c2, "c3": c3, "c4": c4, "c5": c5}
 
 
-def resnet50() -> ResNet:
-    return ResNet([3, 4, 6, 3])
+def resnet50(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
+    return ResNet([3, 4, 6, 3], freeze_at=freeze_at, grad_checkpoint=grad_checkpoint)
 
 
-def resnet101() -> ResNet:
-    return ResNet([3, 4, 23, 3])
+def resnet101(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
+    return ResNet([3, 4, 23, 3], freeze_at=freeze_at, grad_checkpoint=grad_checkpoint)

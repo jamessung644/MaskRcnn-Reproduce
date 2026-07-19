@@ -39,12 +39,15 @@ from .rpn import RPN
 
 
 class MaskRCNN(nn.Module):
-    def __init__(self, cfg: Config = None, backbone_depth: int = 50):
+    def __init__(self, cfg: Config = None, backbone_depth: int = 50,
+                 freeze_at: int = 2, grad_checkpoint: bool = False):
         super().__init__()
         self.cfg = cfg = cfg or Config()
 
         # ---- 백본 + FPN
-        self.backbone = resnet50() if backbone_depth == 50 else resnet101()
+        backbone_fn = resnet50 if backbone_depth == 50 else resnet101
+        self.backbone = backbone_fn(freeze_at=freeze_at,
+                                    grad_checkpoint=grad_checkpoint)
         self.fpn = FPN(self.backbone.out_channels, cfg.fpn_out_channels)
 
         # ---- RPN
