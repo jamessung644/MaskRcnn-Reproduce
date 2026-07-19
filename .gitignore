@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+
+# 데이터셋/출력물만 무시 (루트 기준). 소스 패키지 maskrcnn/data/ 는 추적한다.
+/data/
+/outputs/
+checkpoints/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.log
+.DS_Store
