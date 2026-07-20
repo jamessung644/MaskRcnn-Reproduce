@@ -141,6 +141,14 @@ def parse_args():
                    help="몇 epoch마다 평가할지 (기본 1)")
     p.add_argument("--eval-max-images", type=int, default=None,
                    help="평가에 쓸 이미지 수 제한 (빠른 확인용)")
+    # ---- 선택: 학습 종료 후 최종 리포트 (--eval-images/--eval-ann 있어야 동작)
+    p.add_argument("--no-final-report", action="store_true",
+                   help="학습이 끝난 뒤 --eval-images/--eval-ann로 자동 생성되는 "
+                        "최종 리포트(F1/PR/AP breakdown + 샘플 detection 이미지)를 끈다.")
+    p.add_argument("--report-dir", default=None,
+                   help="최종 리포트 저장 폴더 (기본: <output>/report_epoch<N>)")
+    p.add_argument("--report-detections", type=int, default=8,
+                   help="리포트에 같이 저장할 샘플 detection 시각화 이미지 수 (0=끔)")
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--device", default=None, help="cuda/mps/cpu (기본 자동)")
     p.add_argument("--min-size", type=int, default=800)
@@ -422,7 +430,44 @@ def main():
     if is_main:
         print("학습 종료 [OK]")
 
+        if eval_dataset is not None and not args.no_final_report:
+            report_dir = Path(args.report_dir) if args.report_dir \
+                else out_dir / f"report_epoch{epoch}"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\n최종 리포트 생성 중... -> {report_dir}", flush=True)
+
+            from maskrcnn.evaluate import predict_original
+            from maskrcnn.utils.visualize import draw_detections
+            from plot_metrics import generate_report
+            from PIL import Image
+
+            eval_model = model.module if ddp_active else model
+            eval_model.eval()
+
+            generate_report(
+                eval_model, eval_dataset, device,
+                str(report_dir / "metrics.png"),
+                max_images=args.eval_max_images,
+                min_size=args.min_size, max_size=args.max_size)
+
+            n_det = min(args.report_detections, len(eval_dataset))
+            if n_det > 0:
+                det_dir = report_dir / "detections"
+                det_dir.mkdir(exist_ok=True)
+                for i in range(n_det):
+                    img_id = eval_dataset.image_ids[i]
+                    info = eval_dataset.coco.imgs[img_id]
+                    pil = Image.open(eval_dataset.img_dir / info["file_name"])
+                    det = predict_original(eval_model, pil, device,
+                                           args.min_size, args.max_size)
+                    vis = draw_detections(pil, det, eval_dataset.label_to_name)
+                    vis.save(det_dir / f"det_{Path(info['file_name']).stem}.jpg")
+                print(f"샘플 detection {n_det}장 저장 -> {det_dir}")
+
+            print(f"최종 리포트 저장 완료 -> {report_dir}")
+
     if ddp_active:
+        dist.barrier()  # rank 0의 최종 리포트 생성이 끝날 때까지 나머지 rank 대기
         dist.destroy_process_group()
 
 

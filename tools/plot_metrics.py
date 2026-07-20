@@ -84,27 +84,28 @@ def pick_device(name):
     return torch.device("cpu")
 
 
-def main():
-    args = parse_args()
-    device = pick_device(args.device)
-    print(f"device: {device}")
+def generate_report(model, dataset, device, output: str,
+                    iou_thresh: float = 0.5,
+                    iou_types=("bbox", "segm"),
+                    max_images=None, min_size: int = 800, max_size: int = 1333,
+                    verbose: bool = True) -> dict:
+    """평가 + PR/F1 curve + AP breakdown을 한 번에 계산해 저장한다.
 
-    model, _ = load_checkpoint(args.checkpoint, device)
-    dataset = CocoInstanceDataset(
-        args.val_images, args.val_ann, contiguous_ids=True,
-        min_size=args.min_size, max_size=args.max_size, skip_empty=False)
-    print(f"평가 이미지 {len(dataset)}장"
-          + (f" (앞 {args.max_images}장만)" if args.max_images else ""))
+    <output>, <output>_breakdown(.png), <output와 같은 stem>.json 세 파일을
+    만든다. tools/train.py가 학습 종료 후 최종 리포트를 만들 때도 이 함수를
+    그대로 재사용한다 (CLI 파싱만 분리돼 있을 뿐 로직은 하나).
 
+    반환: {iou_type: {"AP":..,"AP50":..,"AP75":..,"best_f1":.., ...}}
+    """
     metrics, raw_evals = evaluate_coco(
-        model, dataset, device, iou_types=tuple(args.iou_types),
-        max_images=args.max_images, min_size=args.min_size,
-        max_size=args.max_size, return_raw=True)
+        model, dataset, device, iou_types=iou_types,
+        max_images=max_images, min_size=min_size, max_size=max_size,
+        verbose=verbose, return_raw=True)
 
     curves = {}
     summary = {}
     for iou_type, e in raw_evals.items():
-        c = precision_recall_f1_curve(e, iou_thresh=args.iou_thresh)
+        c = precision_recall_f1_curve(e, iou_thresh=iou_thresh)
         curves[iou_type] = c
         i = c["best_idx"]
         summary[iou_type] = {
@@ -117,28 +118,52 @@ def main():
             "score_thresh_at_best_f1": float(c["score"][i]),
         }
 
-    print("\n===== F1 요약 (IoU>=%.2f) =====" % args.iou_thresh)
-    for iou_type, s in summary.items():
-        print(f"[{iou_type}] best F1={s['best_f1']:.4f} "
-              f"(P={s['precision_at_best_f1']:.4f}, R={s['recall_at_best_f1']:.4f}) "
-              f"@ score_thresh~={s['score_thresh_at_best_f1']:.3f}  "
-              f"| AP={s['AP']:.4f} AP50={s['AP50']:.4f} AP75={s['AP75']:.4f}")
+    if verbose:
+        print("\n===== F1 요약 (IoU>=%.2f) =====" % iou_thresh)
+        for iou_type, s in summary.items():
+            print(f"[{iou_type}] best F1={s['best_f1']:.4f} "
+                  f"(P={s['precision_at_best_f1']:.4f}, R={s['recall_at_best_f1']:.4f}) "
+                  f"@ score_thresh~={s['score_thresh_at_best_f1']:.3f}  "
+                  f"| AP={s['AP']:.4f} AP50={s['AP50']:.4f} AP75={s['AP75']:.4f}")
 
-    out_path = Path(args.output)
+    out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    _plot(curves, args.iou_thresh, out_path)
-    print(f"\n그래프 저장 -> {out_path}")
+    _plot(curves, iou_thresh, out_path)
 
-    per_class = {iou_type: per_class_ap(e, iou_thresh=args.iou_thresh)
+    per_class = {iou_type: per_class_ap(e, iou_thresh=iou_thresh)
                 for iou_type, e in raw_evals.items()}
     breakdown_path = out_path.with_name(out_path.stem + "_breakdown" + out_path.suffix)
-    _plot_breakdown(raw_evals, per_class, dataset, args.iou_thresh, breakdown_path)
-    print(f"breakdown 그래프 저장 -> {breakdown_path}")
+    _plot_breakdown(raw_evals, per_class, dataset, iou_thresh, breakdown_path)
 
     json_path = out_path.with_suffix(".json")
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"수치 요약 저장 -> {json_path}")
+
+    if verbose:
+        print(f"\n그래프 저장 -> {out_path}")
+        print(f"breakdown 그래프 저장 -> {breakdown_path}")
+        print(f"수치 요약 저장 -> {json_path}")
+
+    return summary
+
+
+def main():
+    args = parse_args()
+    device = pick_device(args.device)
+    print(f"device: {device}")
+
+    model, _ = load_checkpoint(args.checkpoint, device)
+    dataset = CocoInstanceDataset(
+        args.val_images, args.val_ann, contiguous_ids=True,
+        min_size=args.min_size, max_size=args.max_size, skip_empty=False)
+    print(f"평가 이미지 {len(dataset)}장"
+          + (f" (앞 {args.max_images}장만)" if args.max_images else ""))
+
+    generate_report(
+        model, dataset, device, args.output,
+        iou_thresh=args.iou_thresh, iou_types=tuple(args.iou_types),
+        max_images=args.max_images, min_size=args.min_size,
+        max_size=args.max_size)
 
 
 def _plot(curves: dict, iou_thresh: float, out_path: Path):
