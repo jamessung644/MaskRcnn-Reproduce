@@ -5,7 +5,7 @@
     - lr: 초반 warmup 후 milestone에서 x0.1
     - loss: RPN(obj+box) + RoI(cls+box) + mask, 전부 합산해 역전파
 
-사용 예 1) COCO (80 클래스 -> 배경 포함 81):
+단일 GPU 실행 (torchrun 없이, COCO 80 클래스 -> 배경 포함 81):
 
     python tools/train.py \
         --train-images data/coco/val2017 \
@@ -24,6 +24,12 @@ DDP 실행 (GPU 2장):
 
 `--num-classes`는 배경을 포함한 값이다 (전경 클래스 K개면 K+1).
 `--batch-size`는 GPU 1장당 배치 크기다 (DDP면 실질 배치는 그 world_size배).
+
+DDP는 `--workers`가 GPU마다 각각 뜨므로 실제 DataLoader worker 프로세스
+수는 world_size배가 된다(예: world_size=2, --workers 2면 워커 4개) — 호스트
+RAM이 빠듯하면 그냥 torchrun 없이 위 단일 GPU 명령으로 돌리는 게 가장
+확실한 완화책이다(worker 수가 절반 이하로 준다). RANK 환경변수가 없으면
+`setup_ddp()`가 자동으로 DDP를 건너뛰므로 코드 변경 없이 그대로 된다.
 """
 import argparse
 import os
@@ -42,12 +48,22 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from maskrcnn import Config, MaskRCNN
 from maskrcnn.data import CocoInstanceDataset, collate_fn
+
+# DataLoader worker(들)이 이미지당 가변 크기의 마스크 텐서(N,H,W, 인스턴스별
+# 풀사이즈)를 매 배치 워커->메인 프로세스로 넘긴다. 기본 'file_descriptor'
+# 전략은 이 텐서들마다 /dev/shm에 공유메모리 세그먼트+fd를 새로 만드는데,
+# 정리가 밀리면 장시간 학습에서 호스트 RAM이 계속 누적돼(수 epoch마다 OOM)
+# 커널이 프로세스를 SIGKILL한다. 'file_system'은 임시 파일 기반이라 이 누적을
+# 피한다 (worker 프로세스가 죽어도 즉시 반환되지 않을 수 있는 tmp 파일이
+# 남을 수 있으나, 계속 자라기만 하는 fd/shm 누적보다 안전하다).
+mp.set_sharing_strategy("file_system")
 
 
 class SmoothedValue:
@@ -101,6 +117,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None,
                    help="기본값: Config.learning_rate")
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--prefetch-factor", type=int, default=2,
+                   help="worker당 미리 만들어 둘 배치 수 (--workers>0일 때만 적용). "
+                        "인스턴스 마스크가 큰 이미지가 많으면 낮춰서 호스트 RAM을 아낀다.")
     p.add_argument("--milestones", type=float, nargs="*", default=[0.7, 0.9],
                    help="전체 epoch 대비 lr 감쇠 시점 (기본 70%%, 90%%)")
     p.add_argument("--pretrained", action="store_true",
@@ -182,17 +201,27 @@ def main():
                   f"{len(dataset.label_to_name)}개다 (배경 포함 "
                   f"{len(dataset.label_to_name)+1} 권장).")
 
+    # workers>0일 때만 의미있는 옵션들: persistent_workers로 epoch마다 worker
+    # 프로세스를 죽였다 새로 만드는 걸 막고(재생성 비용/누적 오버헤드 감소),
+    # prefetch_factor로 미리 쌓아두는 배치 수를 제한해 호스트 RAM을 아낀다.
+    worker_kwargs = {}
+    if args.workers > 0:
+        worker_kwargs.update(persistent_workers=True,
+                             prefetch_factor=args.prefetch_factor)
+
     if ddp_active:
         sampler = DistributedSampler(dataset, num_replicas=world_size,
                                       rank=rank, shuffle=True, drop_last=True)
         loader = DataLoader(
             dataset, batch_size=args.batch_size, sampler=sampler,
-            num_workers=args.workers, collate_fn=collate_fn, drop_last=True)
+            num_workers=args.workers, collate_fn=collate_fn, drop_last=True,
+            **worker_kwargs)
     else:
         sampler = None
         loader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, collate_fn=collate_fn, drop_last=True)
+            num_workers=args.workers, collate_fn=collate_fn, drop_last=True,
+            **worker_kwargs)
 
     # ---- 선택: 검증셋 (epoch마다 mAP 평가, rank 0만)
     eval_dataset = None
