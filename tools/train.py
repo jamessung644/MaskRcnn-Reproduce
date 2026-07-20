@@ -116,10 +116,18 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=None,
                    help="기본값: Config.learning_rate")
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--prefetch-factor", type=int, default=2,
+    p.add_argument("--workers", type=int, default=2,
+                   help="DataLoader worker 수. DDP면 GPU마다 각각 뜨므로 실제 "
+                        "프로세스 수는 world_size배다 — 호스트 RAM이 빠듯하면 낮춘다.")
+    p.add_argument("--prefetch-factor", type=int, default=1,
                    help="worker당 미리 만들어 둘 배치 수 (--workers>0일 때만 적용). "
                         "인스턴스 마스크가 큰 이미지가 많으면 낮춰서 호스트 RAM을 아낀다.")
+    p.add_argument("--mask-downsample", type=int, default=4,
+                   help="GT 마스크를 이미지보다 이 배율만큼 더 줄여 저장한다 "
+                        "(호스트 RAM 절약 — 최종 28x28 mask head 출력보다 훨씬 "
+                        "크게만 유지되면 정보 손실은 미미하다). 1이면 다운샘플 없음.")
+    p.add_argument("--no-hflip", action="store_true",
+                   help="랜덤 좌우 반전 augmentation을 끈다 (기본은 켜짐, p=0.5)")
     p.add_argument("--milestones", type=float, nargs="*", default=[0.7, 0.9],
                    help="전체 epoch 대비 lr 감쇠 시점 (기본 70%%, 90%%)")
     p.add_argument("--pretrained", action="store_true",
@@ -193,9 +201,12 @@ def main():
     # ---- 데이터
     dataset = CocoInstanceDataset(
         args.train_images, args.train_ann,
-        contiguous_ids=True, min_size=args.min_size, max_size=args.max_size)
+        contiguous_ids=True, min_size=args.min_size, max_size=args.max_size,
+        augment=not args.no_hflip, mask_downsample=args.mask_downsample)
     if is_main:
         print(f"학습 이미지 {len(dataset)}장, 전경 클래스 {len(dataset.label_to_name)}개")
+        print(f"  augmentation(hflip): {not args.no_hflip}  "
+              f"mask_downsample: {args.mask_downsample}")
         if args.num_classes != len(dataset.label_to_name) + 1:
             print(f"  [경고] --num-classes={args.num_classes} 이지만 데이터셋 클래스는 "
                   f"{len(dataset.label_to_name)}개다 (배경 포함 "
@@ -311,6 +322,8 @@ def main():
         print(f"  backbone freeze_at: {args.freeze_at}")
         print(f"  grad checkpoint   : {args.grad_checkpoint}")
         print(f"  ddp find_unused   : {args.ddp_find_unused}")
+        print(f"  hflip augment     : {not args.no_hflip}")
+        print(f"  mask_downsample   : {args.mask_downsample}")
         print(f"  체크포인트 경로   : {out_dir}")
         print("=" * 66, flush=True)
 

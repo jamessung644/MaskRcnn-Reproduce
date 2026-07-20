@@ -243,9 +243,14 @@ class MaskRCNN(nn.Module):
                 mask_proposals, targets, pos_matched_idxs, pos_labels):
             if props.shape[0] == 0:
                 continue
-            gt_masks = target["masks"]  # (num_gt, H, W)
+            gt_masks = target["masks"]  # (num_gt, h_m, w_m) — 다운샘플됐을 수 있음
+            # mask_downsample>1로 GT 마스크를 이미지보다 더 줄여 저장했다면
+            # (호스트 RAM 절약, CocoInstanceDataset(mask_downsample=..) 참고)
+            # box 좌표(원본 이미지 스케일)를 그만큼 줄여서 마스크 좌표계에
+            # 맞춰야 한다 — 그 배율이 target["mask_scale"]이다(기본 1.0).
+            mask_scale = float(target.get("mask_scale", 1.0))
             mask_targets.append(
-                _project_masks_on_boxes(gt_masks, props, m_idx, M))
+                _project_masks_on_boxes(gt_masks, props, m_idx, M, mask_scale))
             labels_cat.append(lbl)
 
         mask_targets = torch.cat(mask_targets, dim=0)  # (P, M, M)
@@ -352,13 +357,19 @@ class MaskRCNN(nn.Module):
 
 
 def _project_masks_on_boxes(gt_masks: Tensor, boxes: Tensor,
-                            matched_idxs: Tensor, M: int) -> Tensor:
+                            matched_idxs: Tensor, M: int,
+                            mask_scale: float = 1.0) -> Tensor:
     """positive proposal 박스로 GT 마스크를 잘라 MxM으로 리샘플한다.
 
-    gt_masks: (num_gt, H, W), boxes: (P, 4), matched_idxs: (P,) GT 인덱스
+    gt_masks: (num_gt, h_m, w_m), boxes: (P, 4) — 원본 이미지 스케일 좌표,
+    matched_idxs: (P,) GT 인덱스.
+    mask_scale: gt_masks가 이미지보다 이 배율만큼 더 다운샘플된 상태일 때(호스트
+        RAM 절약, CocoInstanceDataset(mask_downsample=..) 참고) box 좌표를
+        gt_masks 좌표계로 맞추기 위한 roi_align의 spatial_scale. 기본 1.0이면
+        기존과 동일(다운샘플 없음).
     반환: (P, M, M), 값은 [0, 1] (roi_align bilinear 결과) — BCE 타깃으로 사용.
     """
     rois = torch.cat([matched_idxs[:, None].to(boxes), boxes], dim=1)
-    gt_masks = gt_masks[:, None].to(boxes)  # (num_gt, 1, H, W)
-    return roi_align(gt_masks, rois, (M, M), spatial_scale=1.0,
+    gt_masks = gt_masks[:, None].to(boxes)  # (num_gt, 1, h_m, w_m)
+    return roi_align(gt_masks, rois, (M, M), spatial_scale=mask_scale,
                      sampling_ratio=1, aligned=True)[:, 0]
