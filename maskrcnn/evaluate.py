@@ -182,3 +182,27 @@ def precision_recall_f1_curve(coco_eval: "COCOeval", iou_thresh: float = 0.5,
         "score": np.nan_to_num(mean_score, nan=0.0),
         "best_idx": best_idx,
     }
+
+
+def per_class_ap(coco_eval: "COCOeval", iou_thresh: float = 0.5,
+                 area: str = "all", max_dets: Optional[int] = None
+                 ) -> Dict[int, float]:
+    """카테고리별 AP(주어진 IoU 기준, recall grid 평균). GT 없는 클래스는 제외.
+
+    반환: {원본 COCO category_id: AP}. `dataset.coco.cats[cid]["name"]`으로
+    이름을 붙일 수 있다 (evaluate_coco의 label_to_cat 역매핑과 같은 catId 축).
+    """
+    p = coco_eval.params
+    t_idx = int(np.argmin(np.abs(np.array(p.iouThrs) - iou_thresh)))
+    a_idx = p.areaRngLbl.index(area)
+    m_idx = (p.maxDets.index(max_dets) if max_dets is not None
+             else len(p.maxDets) - 1)
+
+    precision = coco_eval.eval["precision"][t_idx, :, :, a_idx, m_idx]  # (R, K)
+    out: Dict[int, float] = {}
+    for k, cat_id in enumerate(p.catIds):
+        col = precision[:, k]
+        valid = col > -1
+        if valid.any():
+            out[cat_id] = float(col[valid].mean())
+    return out
