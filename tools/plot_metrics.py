@@ -120,7 +120,11 @@ def main():
 def _plot(curves: dict, iou_thresh: float, out_path: Path):
     fig, (ax_pr, ax_f1) = plt.subplots(1, 2, figsize=(11, 4.5))
 
-    for iou_type, c in curves.items():
+    # 두 계열(bbox/segm)의 best-F1 지점이 서로 가까울 때 라벨이 겹치지 않도록
+    # 계열마다 반대 방향으로 떨어뜨리고, 점과 라벨을 얇은 선으로 이어준다.
+    label_offsets = [(10, 16), (10, -28)]
+
+    for idx, (iou_type, c) in enumerate(curves.items()):
         color = COLORS.get(iou_type, "#555555")
         i = c["best_idx"]
 
@@ -133,10 +137,13 @@ def _plot(curves: dict, iou_thresh: float, out_path: Path):
                   label=iou_type)
         ax_f1.scatter([c["recall"][i]], [c["f1"][i]], color=color,
                      s=36, zorder=3)
-        ax_f1.annotate(f"F1={c['f1'][i]:.2f}\n@{c['score'][i]:.2f}",
+        xytext = label_offsets[idx % len(label_offsets)]
+        ax_f1.annotate(f"F1={c['f1'][i]:.2f} @{c['score'][i]:.2f}",
                       (c["recall"][i], c["f1"][i]),
-                      textcoords="offset points", xytext=(6, 6),
-                      fontsize=8, color=color)
+                      textcoords="offset points", xytext=xytext,
+                      fontsize=8, color=color, ha="left",
+                      arrowprops=dict(arrowstyle="-", color=color,
+                                      lw=0.75, alpha=0.6))
 
     for ax, title, ylabel in (
         (ax_pr, f"Precision-Recall (IoU>={iou_thresh:.2f})", "Precision"),
