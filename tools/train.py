@@ -429,7 +429,7 @@ def main():
                 eval_model, eval_dataset, device,
                 max_images=args.eval_max_images,
                 min_size=args.min_size, max_size=args.max_size,
-                verbose=False)
+                verbose=True)
             summary = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(f"[epoch {epoch} mAP] {summary}", flush=True)
             eval_model.train()

@@ -81,6 +81,11 @@ def evaluate_coco(model, dataset, device,
     results_segm: List[dict] = []
     model.eval()
 
+    # 이미지 1장씩 순차 추론이라 전체가 끝날 때까지 아무 출력도 없으면
+    # 멈춘 것처럼 보인다 — 데이터셋 크기에 상관없이 대략 10번 정도
+    # 진행 상황을 찍도록 간격을 크기에 맞춰 계산한다(200장이든 5000장이든).
+    print_interval = max(1, len(image_ids) // 10)
+
     for n, img_id in enumerate(image_ids):
         info = dataset.coco.imgs[img_id]
         H, W = info["height"], info["width"]
@@ -107,7 +112,7 @@ def evaluate_coco(model, dataset, device,
                     "segmentation": rle, "score": score,
                 })
 
-        if verbose and (n + 1) % 200 == 0:
+        if verbose and (n + 1) % print_interval == 0:
             print(f"  [eval] {n + 1}/{len(image_ids)} 이미지 추론 완료", flush=True)
 
     coco_gt = COCO(dataset.ann_file)
