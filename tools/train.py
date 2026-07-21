@@ -36,6 +36,7 @@ import os
 import sys
 import time
 from collections import defaultdict, deque
+from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,7 +99,11 @@ def format_time(seconds: float) -> str:
 def setup_ddp():
     if "RANK" not in os.environ:
         return False, 0, 0, 1
-    dist.init_process_group(backend="nccl")
+    # 기본 NCCL timeout(10분)은 rank 0에서만 도는 검증셋 평가(evaluate_coco,
+    # 이미지 1장씩 순차 추론이라 val 전체를 돌면 쉽게 10분을 넘는다)가 끝날
+    # 때까지 나머지 rank가 dist.barrier()에서 기다리는 동안 그대로 만료돼
+    # 전체 job이 죽는 원인이 된다 — 넉넉하게 늘려서 그 죽음을 막는다.
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
@@ -250,6 +255,11 @@ def main():
             min_size=args.min_size, max_size=args.max_size, skip_empty=False)
         print(f"검증 이미지 {len(eval_dataset)}장 "
               f"(epoch {args.eval_interval}마다 mAP 평가)")
+        if ddp_active and args.eval_max_images is None and len(eval_dataset) > 500:
+            print(f"  [경고] DDP에서는 rank 0만 검증셋을 평가하고 나머지 rank는 "
+                  f"끝날 때까지 기다린다 — {len(eval_dataset)}장 전체를 이미지 1장씩 "
+                  f"순차 추론하면 epoch마다 오래 걸린다. --eval-max-images로 "
+                  f"줄이는 걸 권장한다 (예: --eval-max-images 200).")
 
     # ---- 모델
     model = MaskRCNN(cfg, freeze_at=args.freeze_at,
