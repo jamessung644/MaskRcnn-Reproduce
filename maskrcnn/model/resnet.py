@@ -3,12 +3,21 @@
 Mask R-CNN 논문 3절 'Network Architecture'의 표기로 C2~C5, 즉
 conv2_x ~ conv5_x 각 스테이지의 마지막 residual block 출력을 반환한다.
 
-ResNet-50 구성 (He et al. 2016, Table 1):
+ResNet-50/101 구성 (He et al. 2016, Table 1) — Bottleneck(1x1-3x3-1x1, expansion=4):
     stem : 7x7 conv, 64ch, stride 2  ->  3x3 maxpool, stride 2
-    conv2_x: bottleneck x3, 출력  256ch, stride  4 (C2)
-    conv3_x: bottleneck x4, 출력  512ch, stride  8 (C3)
-    conv4_x: bottleneck x6, 출력 1024ch, stride 16 (C4)
-    conv5_x: bottleneck x3, 출력 2048ch, stride 32 (C5)
+    conv2_x: 출력  256ch, stride  4 (C2)
+    conv3_x: 출력  512ch, stride  8 (C3)
+    conv4_x: 출력 1024ch, stride 16 (C4)
+    conv5_x: 출력 2048ch, stride 32 (C5)
+
+ResNet-18/34 구성 (He et al. 2016, Table 1) — BasicBlock(3x3-3x3, expansion=1):
+    conv2_x: 출력  64ch (C2), conv3_x: 128ch (C3),
+    conv4_x: 256ch (C4), conv5_x: 512ch (C5) — stride는 위와 동일.
+    Bottleneck 대비 채널/연산량이 훨씬 작아 저사양(예: VRAM 16GB급) GPU에서
+    처리량을 우선할 때 쓰는 경량 백본 옵션이다. 단, torchvision의 COCO
+    사전학습 Mask R-CNN(ResNet-50 기반)과는 백본 shape가 달라
+    tv_weights.load_torchvision_pretrained를 쓰면 백본 부분은 매칭되지 않고
+    무작위 초기화로 남는다(FPN 이후 클래스 독립 레이어는 여전히 로드됨).
 
 detection 학습은 배치가 작아 BN 통계가 불안정하므로, Faster/Mask R-CNN
 관례대로 BN을 고정(FrozenBatchNorm)한다.
@@ -85,6 +94,45 @@ class Bottleneck(nn.Module):
         return self.relu(out + identity)
 
 
+class BasicBlock(nn.Module):
+    """3x3 -> 3x3 residual block (He et al. 2016, 그림 5 좌).
+
+    ResNet-18/34에서 쓰는 경량 블록. Bottleneck과 달리 채널을 줄였다 늘리는
+    1x1 conv가 없고 expansion=1이라, 같은 depth 기준으로 파라미터/연산량이
+    훨씬 작다.
+    """
+
+    expansion = 1
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3,
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = FrozenBatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = FrozenBatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                FrozenBatchNorm2d(out_channels),
+            )
+        else:
+            self.downsample = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        return self.relu(out + identity)
+
+
 class ResNet(nn.Module):
     """C2~C5 멀티스케일 피처를 반환하는 ResNet 백본.
 
@@ -101,10 +149,12 @@ class ResNet(nn.Module):
         checkpoint 대상에서 제외한다.
     """
 
-    def __init__(self, stage_blocks: List[int], freeze_at: int = 2,
+    def __init__(self, block, stage_blocks: List[int], freeze_at: int = 2,
                  grad_checkpoint: bool = False):
         super().__init__()
         self.grad_checkpoint = grad_checkpoint
+        self.block = block
+        e = block.expansion
 
         # stem: conv1
         self.conv1 = nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False)
@@ -112,13 +162,14 @@ class ResNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
 
-        self.layer1 = self._make_stage(64, 64, stage_blocks[0], stride=1)      # C2
-        self.layer2 = self._make_stage(256, 128, stage_blocks[1], stride=2)    # C3
-        self.layer3 = self._make_stage(512, 256, stage_blocks[2], stride=2)    # C4
-        self.layer4 = self._make_stage(1024, 512, stage_blocks[3], stride=2)   # C5
+        self.layer1 = self._make_stage(64, 64, stage_blocks[0], stride=1)          # C2
+        self.layer2 = self._make_stage(64 * e, 128, stage_blocks[1], stride=2)     # C3
+        self.layer3 = self._make_stage(128 * e, 256, stage_blocks[2], stride=2)    # C4
+        self.layer4 = self._make_stage(256 * e, 512, stage_blocks[3], stride=2)    # C5
 
-        # C2~C5 채널 수 (FPN lateral 연결에 필요)
-        self.out_channels = [256, 512, 1024, 2048]
+        # C2~C5 채널 수 (FPN lateral 연결에 필요). Bottleneck(e=4)이면
+        # [256,512,1024,2048], BasicBlock(e=1)이면 [64,128,256,512].
+        self.out_channels = [64 * e, 128 * e, 256 * e, 512 * e]
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -137,15 +188,12 @@ class ResNet(nn.Module):
             for p in m.parameters():
                 p.requires_grad = False
 
-    @staticmethod
-    def _make_stage(in_channels: int, bottleneck_channels: int,
+    def _make_stage(self, in_channels: int, planes: int,
                     num_blocks: int, stride: int) -> nn.Sequential:
-        blocks = [Bottleneck(in_channels, bottleneck_channels, stride=stride)]
+        block = self.block
+        blocks = [block(in_channels, planes, stride=stride)]
         for _ in range(num_blocks - 1):
-            blocks.append(
-                Bottleneck(bottleneck_channels * Bottleneck.expansion,
-                           bottleneck_channels)
-            )
+            blocks.append(block(planes * block.expansion, planes))
         return nn.Sequential(*blocks)
 
     def _run_stage(self, stage: nn.Sequential, x: Tensor) -> Tensor:
@@ -164,9 +212,23 @@ class ResNet(nn.Module):
         return {"c2": c2, "c3": c3, "c4": c4, "c5": c5}
 
 
+def resnet18(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
+    """경량 백본 (BasicBlock, C5=512ch). ResNet-50 대비 연산량이 훨씬 작다."""
+    return ResNet(BasicBlock, [2, 2, 2, 2], freeze_at=freeze_at,
+                 grad_checkpoint=grad_checkpoint)
+
+
+def resnet34(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
+    """경량 백본 (BasicBlock, C5=512ch). resnet18보다 깊지만 여전히 Bottleneck보다 가볍다."""
+    return ResNet(BasicBlock, [3, 4, 6, 3], freeze_at=freeze_at,
+                 grad_checkpoint=grad_checkpoint)
+
+
 def resnet50(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
-    return ResNet([3, 4, 6, 3], freeze_at=freeze_at, grad_checkpoint=grad_checkpoint)
+    return ResNet(Bottleneck, [3, 4, 6, 3], freeze_at=freeze_at,
+                 grad_checkpoint=grad_checkpoint)
 
 
 def resnet101(freeze_at: int = 2, grad_checkpoint: bool = False) -> ResNet:
-    return ResNet([3, 4, 23, 3], freeze_at=freeze_at, grad_checkpoint=grad_checkpoint)
+    return ResNet(Bottleneck, [3, 4, 23, 3], freeze_at=freeze_at,
+                  grad_checkpoint=grad_checkpoint)

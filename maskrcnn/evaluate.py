@@ -25,8 +25,9 @@ def load_checkpoint(path: str, device, anchor_offset: float = 0.5):
     """train.py 체크포인트 -> (model(eval), label_to_name)."""
     ckpt = torch.load(path, map_location=device)
     num_classes = ckpt["num_classes"]
+    backbone_depth = ckpt.get("backbone_depth", 50)  # 구버전 체크포인트 호환
     cfg = Config(num_classes=num_classes, anchor_offset=anchor_offset)
-    model = MaskRCNN(cfg)
+    model = MaskRCNN(cfg, backbone_depth=backbone_depth)
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
     label_to_name = ckpt.get("label_to_name", {})

@@ -34,8 +34,14 @@ from .fpn import FPN
 from .heads import BoxHead, BoxPredictor, MaskHead
 from .matcher import BalancedPositiveNegativeSampler, Matcher, smooth_l1_loss
 from .pooler import MultiScaleRoIAlign
-from .resnet import resnet50, resnet101
+from .resnet import resnet18, resnet34, resnet50, resnet101
 from .rpn import RPN
+
+# backbone_depth -> 생성 함수. 18/34는 BasicBlock 기반 경량 백본으로, VRAM이
+# 작거나(예: 16GB급 GPU) 처리량을 우선할 때 쓴다(연산량이 50/101보다 훨씬
+# 작은 대신, torchvision COCO 사전학습 백본과는 shape가 달라 그 이득은
+# 못 받는다 — resnet.py 모듈 docstring 참고).
+_BACKBONES = {18: resnet18, 34: resnet34, 50: resnet50, 101: resnet101}
 
 
 class MaskRCNN(nn.Module):
@@ -45,7 +51,11 @@ class MaskRCNN(nn.Module):
         self.cfg = cfg = cfg or Config()
 
         # ---- 백본 + FPN
-        backbone_fn = resnet50 if backbone_depth == 50 else resnet101
+        if backbone_depth not in _BACKBONES:
+            raise ValueError(
+                f"backbone_depth={backbone_depth} 미지원 (가능한 값: "
+                f"{sorted(_BACKBONES)})")
+        backbone_fn = _BACKBONES[backbone_depth]
         self.backbone = backbone_fn(freeze_at=freeze_at,
                                     grad_checkpoint=grad_checkpoint)
         self.fpn = FPN(self.backbone.out_channels, cfg.fpn_out_channels)

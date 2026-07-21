@@ -165,6 +165,14 @@ def parse_args():
                    help="백본 고정 stage 수 (Detectron 기본값 2 = stem+layer1). "
                         "0이면 전체 학습 — activation 메모리를 가장 많이 쓰지만 "
                         "가장 유연하다. OOM이면 늘려본다 (최대 5).")
+    p.add_argument("--backbone-depth", type=int, default=50,
+                   choices=[18, 34, 50, 101],
+                   help="백본 깊이. 18/34는 BasicBlock 기반 경량 백본으로 "
+                        "ResNet-50/101(Bottleneck)보다 연산량이 훨씬 작다 — "
+                        "VRAM이 작거나(예: 16GB급) 처리량을 우선할 때 쓴다. "
+                        "단, --pretrained의 torchvision COCO 가중치는 "
+                        "ResNet-50 백본 기준이라 18/34에서는 백본 부분이 "
+                        "매칭되지 않고 무작위 초기화로 남는다.")
     p.add_argument("--grad-checkpoint", action="store_true",
                    help="백본 layer1~4에 gradient checkpointing 적용. "
                         "메모리를 크게 아끼는 대신 backward에서 재계산하느라 "
@@ -262,7 +270,8 @@ def main():
                   f"줄이는 걸 권장한다 (예: --eval-max-images 200).")
 
     # ---- 모델
-    model = MaskRCNN(cfg, freeze_at=args.freeze_at,
+    model = MaskRCNN(cfg, backbone_depth=args.backbone_depth,
+                     freeze_at=args.freeze_at,
                      grad_checkpoint=args.grad_checkpoint)
     if args.pretrained:
         from maskrcnn.utils.tv_weights import load_torchvision_pretrained
@@ -334,6 +343,7 @@ def main():
         print(f"  lr 감쇠 시점(iter): {milestones}  (x0.1)")
         print(f"  warmup iters      : {cfg.warmup_iters}")
         print(f"  입력 해상도       : min {args.min_size} / max {args.max_size}")
+        print(f"  backbone depth    : {args.backbone_depth}")
         print(f"  pretrained init   : {args.pretrained}")
         print(f"  amp (bf16)        : {use_amp}")
         print(f"  grad clip         : {args.grad_clip}")
@@ -407,6 +417,7 @@ def main():
                 "epoch": epoch,
                 "global_step": global_step,
                 "num_classes": args.num_classes,
+                "backbone_depth": args.backbone_depth,
                 "label_to_name": dataset.label_to_name,
             }, ckpt_path)
             epoch_time = time.time() - epoch_start

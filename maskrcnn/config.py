@@ -31,11 +31,16 @@ class Config:
     # ------------------------------------------------------------------ RPN
     # Faster R-CNN 논문: NMS IoU 0.7
     rpn_nms_thresh: float = 0.7
-    # FPN 기반 proposal 수 (Detectron 기본값)
-    rpn_pre_nms_top_n_train: int = 2000   # 레벨당
-    rpn_pre_nms_top_n_test: int = 1000    # 레벨당
-    rpn_post_nms_top_n_train: int = 2000  # 이미지당 (Mask R-CNN 논문 4.1절: FPN은 2000)
-    rpn_post_nms_top_n_test: int = 1000   # 이미지당 (FPN 논문 4.1절)
+    # FPN 기반 proposal 수. 원래 Detectron/논문 기본값은 train 2000/2000,
+    # test 1000/1000이었으나, 여기서는 16GB급 GPU x2(Ada 2000) 환경에서
+    # 처리량을 우선하는 경량화 프로파일로 절반 수준으로 낮췄다 — box/mask
+    # head가 RoI마다 연산하므로 proposal 수를 줄이면 학습/추론 모두
+    # 직접적으로 빨라진다. 정확도를 원래 수준으로 맞추고 싶으면 주석의
+    # 원래 값으로 되돌리면 된다.
+    rpn_pre_nms_top_n_train: int = 1000   # 레벨당 (원래 2000)
+    rpn_pre_nms_top_n_test: int = 500     # 레벨당 (원래 1000)
+    rpn_post_nms_top_n_train: int = 1000  # 이미지당 (원래 2000, Mask R-CNN 논문 4.1절)
+    rpn_post_nms_top_n_test: int = 500    # 이미지당 (원래 1000, FPN 논문 4.1절)
     rpn_min_size: float = 0.0  # 이 크기보다 작은 proposal 제거
 
     # -------------------------------------------------- RPN 학습 타깃/샘플링
@@ -64,9 +69,13 @@ class Config:
     box_head_fc_dim: int = 1024
 
     # ------------------------------------------------------------ Mask head
-    # Mask R-CNN 논문 그림 4(우): conv 4개(256ch) + deconv + 1x1, 출력 28x28
-    mask_head_num_convs: int = 4
-    mask_head_conv_dim: int = 256
+    # Mask R-CNN 논문 그림 4(우) 원래 값: conv 4개(256ch) + deconv + 1x1, 출력 28x28.
+    # 여기서는 경량화 프로파일로 conv 2개(128ch)로 줄였다 — mask branch는
+    # 14x14 해상도에서 conv를 여러 번 돌리는 부분이라 연산 비중이 커서,
+    # 줄이면 처리량에 직접적인 이득이 있다(대신 마스크 품질은 다소 낮아질
+    # 수 있다). 정확도를 우선하면 4/256으로 되돌리면 된다.
+    mask_head_num_convs: int = 2   # 원래 4
+    mask_head_conv_dim: int = 128  # 원래 256
     mask_resolution: int = 28
 
     # ------------------------------------------------------- 추론 후처리
@@ -81,8 +90,11 @@ class Config:
     # foreground(해당 GT 클래스), < 0.5면 background(클래스 0)로 둔다.
     box_fg_iou_thresh: float = 0.5
     box_bg_iou_thresh: float = 0.5
-    # Mask R-CNN 논문 3.1절: 이미지당 512개 RoI를 positive 비율 25%로 샘플링.
-    box_batch_size_per_image: int = 512
+    # Mask R-CNN 논문 3.1절 원래 값: 이미지당 512개 RoI를 positive 비율
+    # 25%로 샘플링. 경량화 프로파일에서는 256개로 줄였다 — box/mask head가
+    # 스텝마다 처리하는 RoI 수가 절반이 되어 iteration이 빨라진다(수렴에
+    # 필요한 step 수가 다소 늘 수 있는 트레이드오프).
+    box_batch_size_per_image: int = 256  # 원래 512
     box_positive_fraction: float = 0.25
 
     # ------------------------------------------------------- 학습 스케줄
