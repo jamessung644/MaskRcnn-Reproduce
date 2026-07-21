@@ -57,6 +57,11 @@ from torch.utils.data.distributed import DistributedSampler
 from maskrcnn import Config, MaskRCNN
 from maskrcnn.data import CocoInstanceDataset, collate_fn
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None  # 없으면 --no-progress-bar와 동일하게 텍스트 로그로 자동 대체
+
 # DataLoader worker(들)이 이미지당 가변 크기의 마스크 텐서(N,H,W, 인스턴스별
 # 풀사이즈)를 매 배치 워커->메인 프로세스로 넘긴다. 기본 'file_descriptor'
 # 전략은 이 텐서들마다 /dev/shm에 공유메모리 세그먼트+fd를 새로 만드는데,
@@ -155,6 +160,10 @@ def parse_args():
     p.add_argument("--report-detections", type=int, default=8,
                    help="리포트에 같이 저장할 샘플 detection 시각화 이미지 수 (0=끔)")
     p.add_argument("--log-interval", type=int, default=20)
+    p.add_argument("--no-progress-bar", action="store_true",
+                   help="tqdm 진행률 바를 끄고 --log-interval 간격의 텍스트 로그만 "
+                        "출력한다(예: 로그 파일을 그대로 파싱하는 파이프라인에 붙일 때). "
+                        "tqdm이 설치돼 있지 않으면 자동으로 이 모드로 동작한다.")
     p.add_argument("--device", default=None, help="cuda/mps/cpu (기본 자동)")
     p.add_argument("--min-size", type=int, default=800)
     p.add_argument("--max-size", type=int, default=1333)
@@ -207,6 +216,20 @@ def main():
     args = parse_args()
     ddp_active, rank, local_rank, world_size = setup_ddp()
     is_main = (rank == 0)
+
+    # DDP에서는 rank 0만 진행률 바를 그린다(여러 rank가 동시에 그리면 터미널/
+    # 로그가 서로 덮어써서 깨진다).
+    use_progress_bar = is_main and not args.no_progress_bar and tqdm is not None
+    if is_main and not args.no_progress_bar and tqdm is None:
+        print("[경고] tqdm이 설치돼 있지 않아 진행률 바 없이 텍스트 로그만 출력한다 "
+              "(`pip install tqdm`으로 설치하면 진행 바가 보인다).", flush=True)
+
+    def log(msg: str):
+        """진행률 바가 떠 있을 때 그 줄을 안 깨뜨리고 로그를 찍는다."""
+        if use_progress_bar:
+            tqdm.write(msg)
+        else:
+            print(msg, flush=True)
 
     if ddp_active:
         device = torch.device(f"cuda:{local_rank}")
@@ -364,6 +387,10 @@ def main():
         meters = defaultdict(SmoothedValue)  # epoch별 손실 이동평균
         epoch_start = time.time()
 
+        pbar = tqdm(total=iters_per_epoch, desc=f"E{epoch}/{args.epochs - 1}",
+                   unit="it", dynamic_ncols=True, leave=False) \
+            if use_progress_bar else None
+
         for i, (images, image_sizes, targets) in enumerate(loader):
             step_start = time.time()
             images = images.to(device)
@@ -389,13 +416,23 @@ def main():
             iter_time.update(time.time() - step_start)
             global_step += 1
 
+            lr_now = optimizer.param_groups[0]["lr"]
+            if pbar is not None:
+                mem_g = (torch.cuda.max_memory_allocated() / 1e9
+                        if device.type == "cuda" else 0.0)
+                pbar.set_postfix(
+                    loss=f"{meters['loss'].avg:.3f}",
+                    lr=f"{lr_now:.5f}",
+                    **({"mem": f"{mem_g:.1f}G"} if device.type == "cuda" else {}),
+                )
+                pbar.update(1)
+
             if is_main and (i % args.log_interval == 0 or i == iters_per_epoch - 1):
-                lr_now = optimizer.param_groups[0]["lr"]
                 eta = format_time(iter_time.avg * (total_iters - global_step))
                 mem = ""
                 if device.type == "cuda":
                     mem = f" mem={torch.cuda.max_memory_allocated() / 1e9:.1f}G"
-                print(
+                log(
                     f"E{epoch}/{args.epochs} "
                     f"[{i:>4}/{iters_per_epoch}] "
                     f"step {global_step}/{total_iters}  "
@@ -405,9 +442,11 @@ def main():
                     f"mask={meters['loss_mask'].avg:.3f} "
                     f"rpn_obj={meters['rpn_objectness'].avg:.3f} "
                     f"rpn_box={meters['rpn_box_reg'].avg:.3f}  "
-                    f"lr={lr_now:.5f}  {iter_time.avg:.2f}s/it  eta {eta}{mem}",
-                    flush=True,
+                    f"lr={lr_now:.5f}  {iter_time.avg:.2f}s/it  eta {eta}{mem}"
                 )
+
+        if pbar is not None:
+            pbar.close()
 
         if is_main:
             ckpt_path = out_dir / f"maskrcnn_epoch{epoch}.pth"
