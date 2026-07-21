@@ -14,6 +14,7 @@ segmentation은 PIL로 래스터화한다. RLE 마스크는 pycocotools가 설�
 """
 
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
@@ -24,7 +25,8 @@ from PIL import Image, ImageDraw
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .transforms import MAX_SIZE, MIN_SIZE, resize_image_and_target
+from .transforms import (MAX_SIZE, MIN_SIZE, hflip_image_and_target,
+                         resize_image_and_target)
 
 
 class _CocoIndex:
@@ -44,12 +46,22 @@ class CocoInstanceDataset(Dataset):
     def __init__(self, img_dir: str, ann_file: str,
                  contiguous_ids: bool = True,
                  min_size: int = MIN_SIZE, max_size: int = MAX_SIZE,
-                 skip_empty: bool = True):
+                 skip_empty: bool = True, augment: bool = False,
+                 mask_downsample: int = 1):
+        """augment=True면 학습용 랜덤 augmentation(현재: 좌우 반전 p=0.5)을
+        적용한다 — 검증/추론용 데이터셋에는 절대 켜면 안 된다.
+        mask_downsample>1이면 GT 마스크를 추가로 그 배율만큼 줄여 저장해
+        호스트 RAM을 아낀다(모델 쪽 mask target projection이 이 배율을
+        알아야 하므로 MaskRCNN(cfg)의 cfg.mask_gt_downsample과 반드시
+        같은 값이어야 한다 — tools/train.py가 이미 그렇게 맞춰준다).
+        """
         self.img_dir = Path(img_dir)
         self.ann_file = ann_file
         self.coco = _CocoIndex(ann_file)
         self.min_size = min_size
         self.max_size = max_size
+        self.augment = augment
+        self.mask_downsample = mask_downsample
 
         image_ids = sorted(self.coco.imgs.keys())
         if skip_empty:
@@ -81,10 +93,22 @@ class CocoInstanceDataset(Dataset):
         return len(self.image_ids)
 
     # ------------------------------------------------------------------
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int, _retries: int = 5):
+        """이미지가 깨졌거나(다운로드/압축해제 중 잘린 파일 등) 못 읽히면
+        경고만 찍고 다른 인덱스로 넘어간다 — 파일 하나 때문에 DataLoader
+        worker가 죽어서 학습 전체가 멈추는 것보다, 그 이미지 하나만 이번
+        epoch에서 빠지는 게 훨씬 낫다(장시간 학습 중 흔한 실패 모드).
+        """
         img_id = self.image_ids[idx]
         info = self.coco.imgs[img_id]
-        pil = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        try:
+            pil = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        except Exception as e:
+            if _retries <= 0:
+                raise
+            print(f"  [경고] 이미지 로드 실패, 건너뜀: {info['file_name']} ({e})",
+                  flush=True)
+            return self.__getitem__(random.randrange(len(self)), _retries - 1)
         W, H = pil.size
         image = torch.from_numpy(np.array(pil)).permute(2, 0, 1).float() / 255.0
 
@@ -114,7 +138,12 @@ class CocoInstanceDataset(Dataset):
         target["image_id"] = torch.tensor([img_id])
 
         image, target, _ = resize_image_and_target(
-            image, target, self.min_size, self.max_size)
+            image, target, self.min_size, self.max_size,
+            mask_downsample=self.mask_downsample)
+
+        if self.augment and random.random() < 0.5:
+            image, target = hflip_image_and_target(image, target)
+
         return image, target
 
     # ------------------------------------------------------------------

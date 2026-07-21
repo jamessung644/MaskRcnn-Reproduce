@@ -23,11 +23,18 @@ SIZE_DIVISIBLE = 32
 def resize_image_and_target(image: Tensor,
                             target: Optional[Dict[str, Tensor]],
                             min_size: int = MIN_SIZE,
-                            max_size: int = MAX_SIZE
+                            max_size: int = MAX_SIZE,
+                            mask_downsample: int = 1,
                             ) -> Tuple[Tensor, Optional[Dict[str, Tensor]], float]:
     """이미지(그리고 있으면 target)를 단일 스케일로 리사이즈한다.
 
     image: (3, H, W) float [0, 1]
+    mask_downsample: 1보다 크면 GT 마스크를 이미지보다 추가로 이 배율만큼
+        더 줄여서 저장한다 (호스트 RAM 절약용 — 최종적으로 mask head는 28x28
+        로만 pooling하므로 그 사이 해상도는 대부분 버려지는 정보다). 이때
+        target["mask_scale"]에 실제 배율(1/mask_downsample)을 넣어 반환하니,
+        마스크를 다시 사용할 때(RoIAlign 등) box 좌표 쪽 spatial_scale로
+        이 값을 곱해줘야 한다 — 안 곱하면 좌표가 어긋난다.
     반환: (resized_image, resized_target, scale)
     """
     h, w = image.shape[-2:]
@@ -45,15 +52,50 @@ def resize_image_and_target(image: Tensor,
         boxes = target.get("boxes")
         if boxes is not None and boxes.numel() > 0:
             target["boxes"] = boxes * scale
+        mask_h, mask_w = new_h, new_w
+        mask_scale = 1.0
+        if mask_downsample > 1:
+            mask_h = max(1, new_h // mask_downsample)
+            mask_w = max(1, new_w // mask_downsample)
+            mask_scale = mask_h / new_h  # new_w/mask_w와 거의 동일(반올림 오차만)
+        # tensor로 저장 — train.py의 move_targets가 target dict의 모든 값에
+        # .to(device)를 호출하므로 plain float이면 거기서 깨진다.
+        target["mask_scale"] = torch.tensor(mask_scale)
         masks = target.get("masks")
         if masks is not None and masks.numel() > 0:
-            masks = F.interpolate(masks[None].float(), size=(new_h, new_w),
+            masks = F.interpolate(masks[None].float(), size=(mask_h, mask_w),
                                   mode="nearest")[0]
             target["masks"] = masks.to(target["masks"].dtype)
         elif masks is not None:
-            target["masks"] = masks.new_zeros((0, new_h, new_w))
+            target["masks"] = masks.new_zeros((0, mask_h, mask_w))
 
     return image, target, scale
+
+
+def hflip_image_and_target(image: Tensor,
+                           target: Optional[Dict[str, Tensor]]
+                           ) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+    """이미지(그리고 있으면 target)를 좌우 반전한다 (augmentation).
+
+    image: (3, H, W). boxes(xyxy)는 x좌표를, masks는 마지막 축을 반전한다.
+    라벨/mask_scale 등 좌우 대칭과 무관한 필드는 그대로 둔다.
+    """
+    w = image.shape[-1]
+    image = image.flip(-1)
+
+    if target is not None:
+        target = dict(target)
+        boxes = target.get("boxes")
+        if boxes is not None and boxes.numel() > 0:
+            flipped = boxes.clone()
+            flipped[:, 0] = w - boxes[:, 2]
+            flipped[:, 2] = w - boxes[:, 0]
+            target["boxes"] = flipped
+        masks = target.get("masks")
+        if masks is not None and masks.numel() > 0:
+            target["masks"] = masks.flip(-1)
+
+    return image, target
 
 
 def normalize_image(image: Tensor) -> Tensor:

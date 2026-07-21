@@ -53,10 +53,13 @@ def evaluate_coco(model, dataset, device,
                   iou_types=("bbox", "segm"),
                   max_images: Optional[int] = None,
                   min_size: int = 800, max_size: int = 1333,
-                  verbose: bool = True) -> Dict[str, float]:
+                  verbose: bool = True, return_raw: bool = False):
     """COCO mAP 평가. pycocotools가 필요하다.
 
     반환: {"bbox/AP": .., "bbox/AP50": .., "segm/AP": .., ...}
+    return_raw=True면 (metrics, {iou_type: COCOeval}) 튜플을 반환한다 —
+    COCOeval.eval['precision']/['recall']/['scores']에서 F1/PR curve 등
+    scalar AP로는 안 보이는 지표를 뽑아낼 때 쓴다 (tools/plot_metrics.py 참고).
     """
     try:
         from pycocotools.coco import COCO
@@ -77,6 +80,11 @@ def evaluate_coco(model, dataset, device,
     results_bbox: List[dict] = []
     results_segm: List[dict] = []
     model.eval()
+
+    # 이미지 1장씩 순차 추론이라 전체가 끝날 때까지 아무 출력도 없으면
+    # 멈춘 것처럼 보인다 — 데이터셋 크기에 상관없이 대략 10번 정도
+    # 진행 상황을 찍도록 간격을 크기에 맞춰 계산한다(200장이든 5000장이든).
+    print_interval = max(1, len(image_ids) // 10)
 
     for n, img_id in enumerate(image_ids):
         info = dataset.coco.imgs[img_id]
@@ -104,11 +112,12 @@ def evaluate_coco(model, dataset, device,
                     "segmentation": rle, "score": score,
                 })
 
-        if verbose and (n + 1) % 200 == 0:
+        if verbose and (n + 1) % print_interval == 0:
             print(f"  [eval] {n + 1}/{len(image_ids)} 이미지 추론 완료", flush=True)
 
     coco_gt = COCO(dataset.ann_file)
     metrics: Dict[str, float] = {}
+    raw_evals: Dict[str, "COCOeval"] = {}
     for iou_type, results in (("bbox", results_bbox), ("segm", results_segm)):
         if iou_type not in iou_types:
             continue
@@ -125,4 +134,80 @@ def evaluate_coco(model, dataset, device,
         metrics[f"{iou_type}/AP"] = float(e.stats[0])     # AP @[.5:.95]
         metrics[f"{iou_type}/AP50"] = float(e.stats[1])   # AP @.50
         metrics[f"{iou_type}/AP75"] = float(e.stats[2])   # AP @.75
+        raw_evals[iou_type] = e
+
+    if return_raw:
+        return metrics, raw_evals
     return metrics
+
+
+def precision_recall_f1_curve(coco_eval: "COCOeval", iou_thresh: float = 0.5,
+                              area: str = "all", max_dets: Optional[int] = None):
+    """COCOeval.accumulate() 결과에서 카테고리 평균 PR curve와 F1 curve를 뽑는다.
+
+    AP 계산과 동일한 방식(카테고리별 precision을 recall grid 위에서 평균)으로
+    "전체" precision-recall curve를 만들고, 그 위에서 F1 = 2PR/(P+R)을 계산한다.
+    scores 배열도 같은 grid 위에 있어서, best-F1 지점의 근사 confidence
+    threshold도 함께 뽑을 수 있다.
+
+    반환: dict(recall, precision, f1, score, best_idx) — 전부 numpy 배열이고
+        best_idx는 f1이 최대인 recall grid 인덱스.
+    """
+    import numpy as np
+
+    p = coco_eval.params
+    t_idx = int(np.argmin(np.abs(np.array(p.iouThrs) - iou_thresh)))
+    a_idx = p.areaRngLbl.index(area)
+    m_idx = (p.maxDets.index(max_dets) if max_dets is not None
+             else len(p.maxDets) - 1)
+
+    # (R, K): recall grid x 카테고리. 유효 카테고리(-1 아닌) 없는 recall은 nan.
+    precision = coco_eval.eval["precision"][t_idx, :, :, a_idx, m_idx]
+    scores = coco_eval.eval["scores"][t_idx, :, :, a_idx, m_idx]
+    valid = precision > -1
+
+    recall = np.array(p.recThrs)
+    mean_precision = np.full(recall.shape, np.nan)
+    mean_score = np.full(recall.shape, np.nan)
+    for r in range(precision.shape[0]):
+        col = valid[r]
+        if col.any():
+            mean_precision[r] = precision[r, col].mean()
+            mean_score[r] = scores[r, col].mean()
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        f1 = 2 * mean_precision * recall / (mean_precision + recall)
+    f1 = np.nan_to_num(f1, nan=0.0)
+
+    best_idx = int(np.nanargmax(f1)) if np.isfinite(f1).any() else 0
+    return {
+        "recall": recall,
+        "precision": np.nan_to_num(mean_precision, nan=0.0),
+        "f1": f1,
+        "score": np.nan_to_num(mean_score, nan=0.0),
+        "best_idx": best_idx,
+    }
+
+
+def per_class_ap(coco_eval: "COCOeval", iou_thresh: float = 0.5,
+                 area: str = "all", max_dets: Optional[int] = None
+                 ) -> Dict[int, float]:
+    """카테고리별 AP(주어진 IoU 기준, recall grid 평균). GT 없는 클래스는 제외.
+
+    반환: {원본 COCO category_id: AP}. `dataset.coco.cats[cid]["name"]`으로
+    이름을 붙일 수 있다 (evaluate_coco의 label_to_cat 역매핑과 같은 catId 축).
+    """
+    p = coco_eval.params
+    t_idx = int(np.argmin(np.abs(np.array(p.iouThrs) - iou_thresh)))
+    a_idx = p.areaRngLbl.index(area)
+    m_idx = (p.maxDets.index(max_dets) if max_dets is not None
+             else len(p.maxDets) - 1)
+
+    precision = coco_eval.eval["precision"][t_idx, :, :, a_idx, m_idx]  # (R, K)
+    out: Dict[int, float] = {}
+    for k, cat_id in enumerate(p.catIds):
+        col = precision[:, k]
+        valid = col > -1
+        if valid.any():
+            out[cat_id] = float(col[valid].mean())
+    return out

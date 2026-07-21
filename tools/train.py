@@ -5,7 +5,7 @@
     - lr: 초반 warmup 후 milestone에서 x0.1
     - loss: RPN(obj+box) + RoI(cls+box) + mask, 전부 합산해 역전파
 
-사용 예 1) COCO (80 클래스 -> 배경 포함 81):
+단일 GPU 실행 (torchrun 없이, COCO 80 클래스 -> 배경 포함 81):
 
     python tools/train.py \
         --train-images data/coco/val2017 \
@@ -24,12 +24,19 @@ DDP 실행 (GPU 2장):
 
 `--num-classes`는 배경을 포함한 값이다 (전경 클래스 K개면 K+1).
 `--batch-size`는 GPU 1장당 배치 크기다 (DDP면 실질 배치는 그 world_size배).
+
+DDP는 `--workers`가 GPU마다 각각 뜨므로 실제 DataLoader worker 프로세스
+수는 world_size배가 된다(예: world_size=2, --workers 2면 워커 4개) — 호스트
+RAM이 빠듯하면 그냥 torchrun 없이 위 단일 GPU 명령으로 돌리는 게 가장
+확실한 완화책이다(worker 수가 절반 이하로 준다). RANK 환경변수가 없으면
+`setup_ddp()`가 자동으로 DDP를 건너뛰므로 코드 변경 없이 그대로 된다.
 """
 import argparse
 import os
 import sys
 import time
 from collections import defaultdict, deque
+from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,12 +49,22 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from maskrcnn import Config, MaskRCNN
 from maskrcnn.data import CocoInstanceDataset, collate_fn
+
+# DataLoader worker(들)이 이미지당 가변 크기의 마스크 텐서(N,H,W, 인스턴스별
+# 풀사이즈)를 매 배치 워커->메인 프로세스로 넘긴다. 기본 'file_descriptor'
+# 전략은 이 텐서들마다 /dev/shm에 공유메모리 세그먼트+fd를 새로 만드는데,
+# 정리가 밀리면 장시간 학습에서 호스트 RAM이 계속 누적돼(수 epoch마다 OOM)
+# 커널이 프로세스를 SIGKILL한다. 'file_system'은 임시 파일 기반이라 이 누적을
+# 피한다 (worker 프로세스가 죽어도 즉시 반환되지 않을 수 있는 tmp 파일이
+# 남을 수 있으나, 계속 자라기만 하는 fd/shm 누적보다 안전하다).
+mp.set_sharing_strategy("file_system")
 
 
 class SmoothedValue:
@@ -82,7 +99,11 @@ def format_time(seconds: float) -> str:
 def setup_ddp():
     if "RANK" not in os.environ:
         return False, 0, 0, 1
-    dist.init_process_group(backend="nccl")
+    # 기본 NCCL timeout(10분)은 rank 0에서만 도는 검증셋 평가(evaluate_coco,
+    # 이미지 1장씩 순차 추론이라 val 전체를 돌면 쉽게 10분을 넘는다)가 끝날
+    # 때까지 나머지 rank가 dist.barrier()에서 기다리는 동안 그대로 만료돼
+    # 전체 job이 죽는 원인이 된다 — 넉넉하게 늘려서 그 죽음을 막는다.
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
@@ -100,7 +121,18 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=None,
                    help="기본값: Config.learning_rate")
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=2,
+                   help="DataLoader worker 수. DDP면 GPU마다 각각 뜨므로 실제 "
+                        "프로세스 수는 world_size배다 — 호스트 RAM이 빠듯하면 낮춘다.")
+    p.add_argument("--prefetch-factor", type=int, default=1,
+                   help="worker당 미리 만들어 둘 배치 수 (--workers>0일 때만 적용). "
+                        "인스턴스 마스크가 큰 이미지가 많으면 낮춰서 호스트 RAM을 아낀다.")
+    p.add_argument("--mask-downsample", type=int, default=4,
+                   help="GT 마스크를 이미지보다 이 배율만큼 더 줄여 저장한다 "
+                        "(호스트 RAM 절약 — 최종 28x28 mask head 출력보다 훨씬 "
+                        "크게만 유지되면 정보 손실은 미미하다). 1이면 다운샘플 없음.")
+    p.add_argument("--no-hflip", action="store_true",
+                   help="랜덤 좌우 반전 augmentation을 끈다 (기본은 켜짐, p=0.5)")
     p.add_argument("--milestones", type=float, nargs="*", default=[0.7, 0.9],
                    help="전체 epoch 대비 lr 감쇠 시점 (기본 70%%, 90%%)")
     p.add_argument("--pretrained", action="store_true",
@@ -114,6 +146,14 @@ def parse_args():
                    help="몇 epoch마다 평가할지 (기본 1)")
     p.add_argument("--eval-max-images", type=int, default=None,
                    help="평가에 쓸 이미지 수 제한 (빠른 확인용)")
+    # ---- 선택: 학습 종료 후 최종 리포트 (--eval-images/--eval-ann 있어야 동작)
+    p.add_argument("--no-final-report", action="store_true",
+                   help="학습이 끝난 뒤 --eval-images/--eval-ann로 자동 생성되는 "
+                        "최종 리포트(F1/PR/AP breakdown + 샘플 detection 이미지)를 끈다.")
+    p.add_argument("--report-dir", default=None,
+                   help="최종 리포트 저장 폴더 (기본: <output>/report_epoch<N>)")
+    p.add_argument("--report-detections", type=int, default=8,
+                   help="리포트에 같이 저장할 샘플 detection 시각화 이미지 수 (0=끔)")
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--device", default=None, help="cuda/mps/cpu (기본 자동)")
     p.add_argument("--min-size", type=int, default=800)
@@ -174,25 +214,38 @@ def main():
     # ---- 데이터
     dataset = CocoInstanceDataset(
         args.train_images, args.train_ann,
-        contiguous_ids=True, min_size=args.min_size, max_size=args.max_size)
+        contiguous_ids=True, min_size=args.min_size, max_size=args.max_size,
+        augment=not args.no_hflip, mask_downsample=args.mask_downsample)
     if is_main:
         print(f"학습 이미지 {len(dataset)}장, 전경 클래스 {len(dataset.label_to_name)}개")
+        print(f"  augmentation(hflip): {not args.no_hflip}  "
+              f"mask_downsample: {args.mask_downsample}")
         if args.num_classes != len(dataset.label_to_name) + 1:
             print(f"  [경고] --num-classes={args.num_classes} 이지만 데이터셋 클래스는 "
                   f"{len(dataset.label_to_name)}개다 (배경 포함 "
                   f"{len(dataset.label_to_name)+1} 권장).")
+
+    # workers>0일 때만 의미있는 옵션들: persistent_workers로 epoch마다 worker
+    # 프로세스를 죽였다 새로 만드는 걸 막고(재생성 비용/누적 오버헤드 감소),
+    # prefetch_factor로 미리 쌓아두는 배치 수를 제한해 호스트 RAM을 아낀다.
+    worker_kwargs = {}
+    if args.workers > 0:
+        worker_kwargs.update(persistent_workers=True,
+                             prefetch_factor=args.prefetch_factor)
 
     if ddp_active:
         sampler = DistributedSampler(dataset, num_replicas=world_size,
                                       rank=rank, shuffle=True, drop_last=True)
         loader = DataLoader(
             dataset, batch_size=args.batch_size, sampler=sampler,
-            num_workers=args.workers, collate_fn=collate_fn, drop_last=True)
+            num_workers=args.workers, collate_fn=collate_fn, drop_last=True,
+            **worker_kwargs)
     else:
         sampler = None
         loader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, collate_fn=collate_fn, drop_last=True)
+            num_workers=args.workers, collate_fn=collate_fn, drop_last=True,
+            **worker_kwargs)
 
     # ---- 선택: 검증셋 (epoch마다 mAP 평가, rank 0만)
     eval_dataset = None
@@ -202,6 +255,11 @@ def main():
             min_size=args.min_size, max_size=args.max_size, skip_empty=False)
         print(f"검증 이미지 {len(eval_dataset)}장 "
               f"(epoch {args.eval_interval}마다 mAP 평가)")
+        if ddp_active and args.eval_max_images is None and len(eval_dataset) > 500:
+            print(f"  [경고] DDP에서는 rank 0만 검증셋을 평가하고 나머지 rank는 "
+                  f"끝날 때까지 기다린다 — {len(eval_dataset)}장 전체를 이미지 1장씩 "
+                  f"순차 추론하면 epoch마다 오래 걸린다. --eval-max-images로 "
+                  f"줄이는 걸 권장한다 (예: --eval-max-images 200).")
 
     # ---- 모델
     model = MaskRCNN(cfg, freeze_at=args.freeze_at,
@@ -282,6 +340,8 @@ def main():
         print(f"  backbone freeze_at: {args.freeze_at}")
         print(f"  grad checkpoint   : {args.grad_checkpoint}")
         print(f"  ddp find_unused   : {args.ddp_find_unused}")
+        print(f"  hflip augment     : {not args.no_hflip}")
+        print(f"  mask_downsample   : {args.mask_downsample}")
         print(f"  체크포인트 경로   : {out_dir}")
         print("=" * 66, flush=True)
 
@@ -369,7 +429,7 @@ def main():
                 eval_model, eval_dataset, device,
                 max_images=args.eval_max_images,
                 min_size=args.min_size, max_size=args.max_size,
-                verbose=False)
+                verbose=True)
             summary = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(f"[epoch {epoch} mAP] {summary}", flush=True)
             eval_model.train()
@@ -380,7 +440,44 @@ def main():
     if is_main:
         print("학습 종료 [OK]")
 
+        if eval_dataset is not None and not args.no_final_report:
+            report_dir = Path(args.report_dir) if args.report_dir \
+                else out_dir / f"report_epoch{epoch}"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\n최종 리포트 생성 중... -> {report_dir}", flush=True)
+
+            from maskrcnn.evaluate import predict_original
+            from maskrcnn.utils.visualize import draw_detections
+            from plot_metrics import generate_report
+            from PIL import Image
+
+            eval_model = model.module if ddp_active else model
+            eval_model.eval()
+
+            generate_report(
+                eval_model, eval_dataset, device,
+                str(report_dir / "metrics.png"),
+                max_images=args.eval_max_images,
+                min_size=args.min_size, max_size=args.max_size)
+
+            n_det = min(args.report_detections, len(eval_dataset))
+            if n_det > 0:
+                det_dir = report_dir / "detections"
+                det_dir.mkdir(exist_ok=True)
+                for i in range(n_det):
+                    img_id = eval_dataset.image_ids[i]
+                    info = eval_dataset.coco.imgs[img_id]
+                    pil = Image.open(eval_dataset.img_dir / info["file_name"])
+                    det = predict_original(eval_model, pil, device,
+                                           args.min_size, args.max_size)
+                    vis = draw_detections(pil, det, eval_dataset.label_to_name)
+                    vis.save(det_dir / f"det_{Path(info['file_name']).stem}.jpg")
+                print(f"샘플 detection {n_det}장 저장 -> {det_dir}")
+
+            print(f"최종 리포트 저장 완료 -> {report_dir}")
+
     if ddp_active:
+        dist.barrier()  # rank 0의 최종 리포트 생성이 끝날 때까지 나머지 rank 대기
         dist.destroy_process_group()
 
 
