@@ -93,10 +93,22 @@ class CocoInstanceDataset(Dataset):
         return len(self.image_ids)
 
     # ------------------------------------------------------------------
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int, _retries: int = 5):
+        """이미지가 깨졌거나(다운로드/압축해제 중 잘린 파일 등) 못 읽히면
+        경고만 찍고 다른 인덱스로 넘어간다 — 파일 하나 때문에 DataLoader
+        worker가 죽어서 학습 전체가 멈추는 것보다, 그 이미지 하나만 이번
+        epoch에서 빠지는 게 훨씬 낫다(장시간 학습 중 흔한 실패 모드).
+        """
         img_id = self.image_ids[idx]
         info = self.coco.imgs[img_id]
-        pil = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        try:
+            pil = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        except Exception as e:
+            if _retries <= 0:
+                raise
+            print(f"  [경고] 이미지 로드 실패, 건너뜀: {info['file_name']} ({e})",
+                  flush=True)
+            return self.__getitem__(random.randrange(len(self)), _retries - 1)
         W, H = pil.size
         image = torch.from_numpy(np.array(pil)).permute(2, 0, 1).float() / 255.0
 
