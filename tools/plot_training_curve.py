@@ -4,15 +4,20 @@ idalog 등으로 저장한 텍스트 로그 파일을 그대로 읽는다 — �
 (--resume)로 로그가 여러 파일에 나뉘어 있으면 --log에 시간순으로 여러 개
 넘기면 된다 (크래시로 겹치는 step 구간은 나중 파일 값으로 덮어써 정리한다).
 
-파싱하는 두 줄 형식 (train.py의 실제 출력 포맷):
+파싱하는 세 줄 형식 (train.py의 실제 출력 포맷):
     E4/12 [ 200/500] step 2201/6000  loss=0.531  cls=0.133 box=0.106 \
         mask=0.240 rpn_obj=0.011 rpn_box=0.042  lr=0.00500  ...
     [epoch 4 완료] avg_loss=0.528  time=0:03:10  -> checkpoints/...
+    [epoch 4 mAP] bbox/AP=0.0523  bbox/AP50=0.1245  bbox/AP75=0.0421  \
+        segm/AP=0.0234  segm/AP50=0.0654  segm/AP75=0.0198
+
+(마지막 줄은 --eval-images/--eval-ann를 주고 학습했을 때만 찍힌다.)
 
 6개 loss 성분을 한 축에 겹쳐 그리면 스케일(mask~0.2 vs rpn_obj~0.01)도 안
 맞고 색으로 6개를 다 구분하는 것도 무리라, 성분별로 작은 서브플롯을 따로
 두는 small-multiples 방식을 쓴다 — 서브플롯 하나 = 시계열 하나라 색 구분이
-필요 없다(전부 동일한 파란색, 제목으로 구분).
+필요 없다(전부 동일한 파란색, 제목으로 구분). mAP는 AP/AP50/AP75 서브플롯
+3개에 bbox/segm 두 계열만 겹쳐 그린다(plot_metrics.py와 같은 파랑/주황).
 
 사용 예:
     python tools/plot_training_curve.py \
@@ -37,6 +42,10 @@ import matplotlib.pyplot as plt
 LINE_COLOR = "#2a78d6"
 EPOCH_LINE_COLOR = "#9a9990"  # muted, epoch 경계 표시용
 
+# mAP 비교 그래프용 — plot_metrics.py와 동일한, validate_palette.js로 확인한
+# bbox/segm 조합 (CVD ΔE 31.1, normal-vision ΔE 36.6).
+MAP_COLORS = {"bbox": "#2f6fed", "segm": "#e2711d"}
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 ITER_RE = re.compile(
     r"E(?P<epoch>\d+)/(?P<total_epochs>\d+)\s*\[\s*\d+/\s*\d+\]\s*"
@@ -48,8 +57,11 @@ ITER_RE = re.compile(
 EPOCH_RE = re.compile(
     r"\[epoch\s*(?P<epoch>\d+)\s*완료\]\s*avg_loss=(?P<avg_loss>[\d.]+)"
 )
+MAP_LINE_RE = re.compile(r"\[epoch\s*(?P<epoch>\d+)\s*mAP\]\s*(?P<rest>.+)")
+MAP_KV_RE = re.compile(r"([a-zA-Z]+/[a-zA-Z0-9]+)=([\d.]+)")
 
 LOSS_FIELDS = ["loss", "cls", "box", "mask", "rpn_obj", "rpn_box"]
+MAP_METRICS = ["AP", "AP50", "AP75"]
 
 
 def parse_args():
@@ -62,13 +74,14 @@ def parse_args():
 
 
 def parse_logs(log_paths):
-    """(step -> 필드 dict, epoch -> avg_loss dict, total_steps) 반환.
+    """(step -> 필드 dict, epoch -> avg_loss dict, epoch -> mAP dict, total_steps) 반환.
 
     step/epoch 키로 저장해두면 재개로 겹치는 구간이 있어도 나중 파일이 자동으로
     앞 파일의 값을 덮어써 정리된다.
     """
     by_step = {}
     epoch_avg = {}
+    map_history = {}
     total_steps = None
 
     for path in log_paths:
@@ -90,11 +103,18 @@ def parse_logs(log_paths):
                 m = EPOCH_RE.search(line)
                 if m:
                     epoch_avg[int(m.group("epoch"))] = float(m.group("avg_loss"))
+                    continue
+
+                m = MAP_LINE_RE.search(line)
+                if m:
+                    epoch = int(m.group("epoch"))
+                    kv = {k: float(v) for k, v in MAP_KV_RE.findall(m.group("rest"))}
+                    map_history[epoch] = kv
 
     if not by_step:
         raise SystemExit("로그에서 학습 iteration 줄을 하나도 못 찾았다 — "
                          "포맷이 바뀌었거나 잘못된 파일인지 확인.")
-    return by_step, epoch_avg, total_steps
+    return by_step, epoch_avg, map_history, total_steps
 
 
 def _epoch_boundaries(by_step):
@@ -110,12 +130,12 @@ def _epoch_boundaries(by_step):
     return boundaries
 
 
-def plot_training_curve(by_step, epoch_avg, total_steps, out_path: Path):
+def plot_training_curve(by_step, epoch_avg, map_history, total_steps, out_path: Path):
     steps = sorted(by_step)
     boundaries = _epoch_boundaries(by_step)
 
     panels = LOSS_FIELDS + ["lr"]
-    n = len(panels) + (1 if epoch_avg else 0)
+    n = len(panels) + (1 if epoch_avg else 0) + (len(MAP_METRICS) if map_history else 0)
     ncols = 4
     nrows = -(-n // ncols)  # ceil
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.0 * nrows))
@@ -133,8 +153,9 @@ def plot_training_curve(by_step, epoch_avg, total_steps, out_path: Path):
         if total_steps:
             ax.set_xlim(0, total_steps)
 
+    next_idx = len(panels)
     if epoch_avg:
-        ax = axes[len(panels)]
+        ax = axes[next_idx]
         epochs = sorted(epoch_avg)
         ax.plot(epochs, [epoch_avg[e] for e in epochs],
                color=LINE_COLOR, linewidth=1.5, marker="o", markersize=3)
@@ -142,6 +163,29 @@ def plot_training_curve(by_step, epoch_avg, total_steps, out_path: Path):
         ax.set_xlabel("epoch", fontsize=8)
         ax.grid(True, linewidth=0.4, alpha=0.3)
         ax.tick_params(labelsize=8)
+        next_idx += 1
+
+    # ---- mAP 비교: AP/AP50/AP75 각각 서브플롯 하나, bbox vs segm 겹쳐 그림
+    if map_history:
+        map_epochs = sorted(map_history)
+        iou_types = sorted({k.split("/")[0] for kv in map_history.values() for k in kv})
+        for metric in MAP_METRICS:
+            ax = axes[next_idx]
+            for iou_type in iou_types:
+                key = f"{iou_type}/{metric}"
+                xs = [e for e in map_epochs if key in map_history[e]]
+                if not xs:
+                    continue
+                ys = [map_history[e][key] for e in xs]
+                ax.plot(xs, ys, color=MAP_COLORS.get(iou_type, "#555555"),
+                       linewidth=1.5, marker="o", markersize=3, label=iou_type)
+            ax.set_title(metric, fontsize=10)
+            ax.set_xlabel("epoch", fontsize=8)
+            ax.set_ylim(0, 1.0)
+            ax.grid(True, linewidth=0.4, alpha=0.3)
+            ax.tick_params(labelsize=8)
+            ax.legend(frameon=False, fontsize=7)
+            next_idx += 1
 
     for ax in axes[n:]:
         ax.axis("off")
@@ -153,16 +197,16 @@ def plot_training_curve(by_step, epoch_avg, total_steps, out_path: Path):
 
 def main():
     args = parse_args()
-    by_step, epoch_avg, total_steps = parse_logs(args.log)
+    by_step, epoch_avg, map_history, total_steps = parse_logs(args.log)
 
     steps = sorted(by_step)
     print(f"iteration 로그 {len(steps)}개 (step {steps[0]}~{steps[-1]}"
           f"{f'/{total_steps}' if total_steps else ''}), "
-          f"epoch 요약 {len(epoch_avg)}개")
+          f"epoch 요약 {len(epoch_avg)}개, mAP 로그 {len(map_history)}개")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plot_training_curve(by_step, epoch_avg, total_steps, out_path)
+    plot_training_curve(by_step, epoch_avg, map_history, total_steps, out_path)
     print(f"학습곡선 저장 -> {out_path}")
 
 
