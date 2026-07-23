@@ -2,9 +2,9 @@
 
 RoIAlign (Mask R-CNN 논문 3절 'RoIAlign'):
     RoIPool의 양자화를 제거하고, 각 bin 안의 규칙적인 샘플링 포인트에서
-    bilinear interpolation으로 값을 계산해 평균한다. 여기서는
-    torchvision.ops.roi_align (aligned=True)을 사용한다 — 논문의 연산과
-    동일한 half-pixel 정렬 구현이다.
+    bilinear interpolation으로 값을 계산해 평균한다. roi_align은 직접 구현한
+    maskrcnn.ops.roi_align(aligned=True)을 쓴다 — torchvision.ops와 수치적으로
+    일치하도록 검증한, 논문의 half-pixel 정렬 연산이다.
 
 레벨 할당 (FPN 논문 식 (1)):
     k = floor(k0 + log2(sqrt(w*h) / 224)),  k0 = 4
@@ -17,7 +17,7 @@ from typing import Dict, List
 
 import torch
 from torch import Tensor, nn
-from torchvision.ops import roi_align
+from ..ops import roi_align
 
 
 class MultiScaleRoIAlign(nn.Module):

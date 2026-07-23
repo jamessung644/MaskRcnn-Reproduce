@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torchvision.ops import nms
+from ..ops import nms
 
 from ..utils import box_ops
 from .matcher import BalancedPositiveNegativeSampler, Matcher, smooth_l1_loss

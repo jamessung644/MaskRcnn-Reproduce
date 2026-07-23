@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torchvision.ops import nms, roi_align
+from ..ops import nms, roi_align
 
 from ..config import Config
 from ..utils import box_ops
