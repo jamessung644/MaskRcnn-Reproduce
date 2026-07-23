@@ -153,9 +153,15 @@ def roi_align(input: Tensor, boxes: Tensor,
         raise ValueError("이 구현은 sampling_ratio >= 1만 지원한다 "
                          f"(받은 값: {sampling_ratio}).")
 
-    dtype = input.dtype
     device = input.device
     batch_idx = boxes[:, 0].round().long()
+
+    # 좌표/보간은 항상 float32로 계산한다. AMP(bfloat16 autocast)에서 input이
+    # bf16이어도 box 좌표 정밀도를 유지하고, 마지막에 input dtype으로 되돌린다
+    # (pooler가 output[idx] = roi_align(...)로 대입하므로 dtype이 반드시
+    # input과 같아야 한다 — 안 맞으면 index_put dtype mismatch 에러).
+    dtype = torch.float32
+    boxes = boxes.float()
 
     offset = 0.5 if aligned else 0.0
     x1 = boxes[:, 1] * spatial_scale - offset
@@ -177,7 +183,7 @@ def roi_align(input: Tensor, boxes: Tensor,
     ph = torch.arange(out_h, device=device, dtype=dtype)  # (OH,)
     pw = torch.arange(out_w, device=device, dtype=dtype)  # (OW,)
 
-    output = input.new_zeros((K, C, out_h, out_w))
+    output = torch.zeros((K, C, out_h, out_w), dtype=dtype, device=device)
     # bin당 sr_h x sr_w 서브샘플을 순회하며 누적 — 모든 샘플을 한 번에
     # 펼치지 않아 peak memory가 낮다.
     for iy in range(sr_h):
@@ -191,4 +197,4 @@ def roi_align(input: Tensor, boxes: Tensor,
                   + (ix + 0.5) * bin_w[:, None] / sr_w)
             output = output + _bilinear_sample(input, batch_idx, yy, xx)
 
-    return output / count
+    return (output / count).to(input.dtype)
