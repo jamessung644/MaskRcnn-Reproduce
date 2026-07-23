@@ -192,6 +192,16 @@ def parse_args():
                         "항상 섞어 넣기 때문에 mask branch가 매 스텝 활성화되어 "
                         "보통 필요 없다 — 꺼두면 DDP가 버킷 뷰를 재사용해 메모리/속도 "
                         "이득이 있다. 커스텀 데이터로 빈 이미지가 섞일 수 있으면 켠다.")
+    # ---- 선택: Weights & Biases 로깅
+    p.add_argument("--wandb", action="store_true",
+                   help="Weights & Biases로 지표/샘플 이미지를 실시간 로깅한다 "
+                        "(`pip install wandb` + `wandb login` 필요). rank 0만 로깅.")
+    p.add_argument("--wandb-project", default="maskrcnn",
+                   help="wandb 프로젝트 이름 (기본 maskrcnn)")
+    p.add_argument("--wandb-run", default=None,
+                   help="wandb run 이름 (생략하면 wandb가 자동 생성)")
+    p.add_argument("--wandb-images", type=int, default=8,
+                   help="검증 때마다 wandb에 올릴 샘플 detection 이미지 수 (0=끔)")
     return p.parse_args()
 
 
@@ -210,6 +220,22 @@ def move_targets(targets, device):
     for t in targets:
         out.append({k: v.to(device) for k, v in t.items()})
     return out
+
+
+def _wandb_detection_images(model, dataset, device, n, min_size, max_size):
+    """검증셋 앞 n장에 detection을 그려 wandb.Image 리스트로 반환한다."""
+    import wandb
+    from maskrcnn.evaluate import predict_original
+    from maskrcnn.utils.visualize import draw_detections
+    from PIL import Image
+    images = []
+    for idx in range(min(n, len(dataset))):
+        info = dataset.coco.imgs[dataset.image_ids[idx]]
+        pil = Image.open(dataset.img_dir / info["file_name"]).convert("RGB")
+        det = predict_original(model, pil, device, min_size, max_size)
+        vis = draw_detections(pil, det, dataset.label_to_name)
+        images.append(wandb.Image(vis, caption=info["file_name"]))
+    return images
 
 
 def main():
@@ -348,6 +374,29 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- 선택: Weights & Biases 로깅 (rank 0만). --resume로 재시작하면
+    # <output>/wandb_run_id.txt에 저장해 둔 run id로 같은 run에 이어 붙는다
+    # (linger 미설정 서버에서 job이 죽었다 재개돼도 대시보드가 끊기지 않게).
+    wandb_run = None
+    if is_main and args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit("--wandb를 쓰려면 wandb가 필요하다 "
+                             "(`pip install wandb` 후 `wandb login`).")
+        run_id_file = out_dir / "wandb_run_id.txt"
+        resume_id = run_id_file.read_text().strip() if run_id_file.exists() else None
+        wandb_run = wandb.init(
+            project=args.wandb_project, name=args.wandb_run,
+            id=resume_id, resume="allow",
+            config={**vars(args), "world_size": world_size,
+                    "effective_batch": args.batch_size * world_size,
+                    "iters_per_epoch": iters_per_epoch,
+                    "total_iters": total_iters, "milestones_iter": milestones},
+        )
+        run_id_file.write_text(wandb_run.id)
+        print(f"wandb 로깅 활성화: {wandb_run.url or f'(offline) run {wandb_run.id}'}")
+
     # ---- 설정 배너
     if is_main:
         print("=" * 66)
@@ -375,6 +424,7 @@ def main():
         print(f"  ddp find_unused   : {args.ddp_find_unused}")
         print(f"  hflip augment     : {not args.no_hflip}")
         print(f"  mask_downsample   : {args.mask_downsample}")
+        print(f"  wandb             : {'on' if wandb_run is not None else 'off'}")
         print(f"  체크포인트 경로   : {out_dir}")
         print("=" * 66, flush=True)
 
@@ -387,7 +437,7 @@ def main():
         meters = defaultdict(SmoothedValue)  # epoch별 손실 이동평균
         epoch_start = time.time()
 
-        pbar = tqdm(total=iters_per_epoch, desc=f"E{epoch}/{args.epochs - 1}",
+        pbar = tqdm(total=iters_per_epoch, desc=f"E{epoch}/{args.epochs}",
                    unit="it", dynamic_ncols=True, leave=False) \
             if use_progress_bar else None
 
@@ -445,6 +495,24 @@ def main():
                     f"lr={lr_now:.5f}  {iter_time.avg:.2f}s/it  eta {eta}{mem}"
                 )
 
+            if wandb_run is not None and (i % args.log_interval == 0
+                                          or i == iters_per_epoch - 1):
+                wandb_log = {
+                    "train/loss": meters["loss"].avg,
+                    "train/loss_box_cls": meters["loss_box_cls"].avg,
+                    "train/loss_box_reg": meters["loss_box_reg"].avg,
+                    "train/loss_mask": meters["loss_mask"].avg,
+                    "train/rpn_objectness": meters["rpn_objectness"].avg,
+                    "train/rpn_box_reg": meters["rpn_box_reg"].avg,
+                    "train/lr": lr_now,
+                    "train/iter_time_s": iter_time.avg,
+                    "epoch": epoch,
+                }
+                if device.type == "cuda":
+                    wandb_log["train/mem_gb"] = \
+                        torch.cuda.max_memory_allocated() / 1e9
+                wandb_run.log(wandb_log, step=global_step)
+
         if pbar is not None:
             pbar.close()
 
@@ -469,6 +537,13 @@ def main():
             )
             print("-" * 66, flush=True)
 
+            if wandb_run is not None:
+                wandb_run.log({
+                    "train/epoch_avg_loss": meters["loss"].global_avg,
+                    "train/epoch_time_s": epoch_time,
+                    "epoch": epoch,
+                }, step=global_step)
+
         # ---- epoch마다 검증셋 mAP 평가 (rank 0만, 선택)
         if is_main and eval_dataset is not None and (epoch + 1) % args.eval_interval == 0:
             from maskrcnn.evaluate import evaluate_coco
@@ -482,6 +557,16 @@ def main():
                 verbose=True)
             summary = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(f"[epoch {epoch} mAP] {summary}", flush=True)
+            if wandb_run is not None:
+                wandb_run.log(
+                    {f"val/{k.replace('/', '_')}": v for k, v in metrics.items()},
+                    step=global_step)
+                if args.wandb_images > 0:
+                    wandb_run.log(
+                        {"val/detections": _wandb_detection_images(
+                            eval_model, eval_dataset, device, args.wandb_images,
+                            args.min_size, args.max_size)},
+                        step=global_step)
             eval_model.train()
 
         if ddp_active:
@@ -525,6 +610,16 @@ def main():
                 print(f"샘플 detection {n_det}장 저장 -> {det_dir}")
 
             print(f"최종 리포트 저장 완료 -> {report_dir}")
+
+            if wandb_run is not None:
+                import wandb
+                for fig in ("metrics.png", "metrics_breakdown.png"):
+                    fp = report_dir / fig
+                    if fp.exists():
+                        wandb_run.log({f"final/{Path(fig).stem}": wandb.Image(str(fp))})
+
+        if wandb_run is not None:
+            wandb_run.finish()
 
     if ddp_active:
         dist.barrier()  # rank 0의 최종 리포트 생성이 끝날 때까지 나머지 rank 대기
